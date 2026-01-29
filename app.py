@@ -96,6 +96,7 @@ async def telegram_webhook(req: Request):
             text = text[:3500] + "…"
         tg_send_message(chat_id, text)
 
+    tg_send_message(chat_id, "Webhook жив, апдейт получил 👍")
     return {"ok": True}
 
 @app.get("/")
