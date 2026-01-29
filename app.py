@@ -64,6 +64,10 @@ def convert_to_mp3(src_path: str, dst_path: str) -> None:
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
     update = await req.json()
+
+    print("UPDATE KEYS:", list(update.keys()))
+    print("MESSAGE KEYS:", list((update.get("message") or {}).keys()))
+    
     message = update.get("message") or update.get("edited_message")
     if not message:
         return {"ok": True}
