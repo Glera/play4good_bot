@@ -15,12 +15,33 @@ app = FastAPI()
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 def tg_send_message(chat_id: int, text: str) -> None:
-    requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=30)
+    try:
+        r = requests.post(
+            f"{TG_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=30,
+        )
+        print("sendMessage status:", r.status_code, "resp:", r.text[:500])
+    except Exception as e:
+        print("sendMessage exception:", repr(e))
+
+#def tg_send_message(chat_id: int, text: str) -> None:
+#   requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=30)
 
 def tg_get_file_path(file_id: str) -> str | None:
-    r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30)
-    data = r.json()
-    return data.get("result", {}).get("file_path")
+    try:
+        r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30)
+        print("getFile status:", r.status_code, "resp:", r.text[:500])
+        data = r.json()
+        return data.get("result", {}).get("file_path")
+    except Exception as e:
+        print("getFile exception:", repr(e))
+        return None
+
+#def tg_get_file_path(file_id: str) -> str | None:
+#    r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30)
+#    data = r.json()
+#    return data.get("result", {}).get("file_path")
 
 def tg_download_file(file_path: str, dst_path: str) -> None:
     url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
