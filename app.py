@@ -70,7 +70,10 @@ async def telegram_webhook(req: Request):
 
     chat_id = message.get("chat", {}).get("id")
     if not chat_id:
+        print("No chat_id in message:", message)
         return {"ok": True}
+
+    tg_send_message(chat_id, "Апдейт получил ✅")
 
     voice = message.get("voice")
     audio = message.get("audio")
