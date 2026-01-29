@@ -1,7 +1,7 @@
 import os
 import tempfile
 import subprocess
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 import requests
 from fastapi import FastAPI, Request
@@ -11,6 +11,10 @@ from openai import OpenAI
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # required for issue creation
+GITHUB_REPO = os.environ.get("GITHUB_REPO")    # "owner/repo"
+GITHUB_LABELS = os.environ.get("GITHUB_LABELS", "")  # "voice,telegram"
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -18,26 +22,28 @@ TG_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 
 app = FastAPI()
 
+# ====== In-memory state (OK for one instance). For scaling: Redis. ======
+# pending[chat_id] = {"stage": "confirm"|"edit", "text": "...", "meta": {...}}
+PENDING: Dict[int, Dict[str, Any]] = {}
+
 
 # ====== Telegram helpers ======
 def tg_send_message(chat_id: int, text: str) -> None:
-    """Send a message to Telegram and log the result."""
     try:
         r = requests.post(
             f"{TG_API}/sendMessage",
             json={"chat_id": chat_id, "text": text},
             timeout=30,
         )
-        print("sendMessage status:", r.status_code, "resp:", r.text[:500])
+        print("sendMessage status:", r.status_code, "resp:", r.text[:300])
     except Exception as e:
         print("sendMessage exception:", repr(e))
 
 
 def tg_get_file_path(file_id: str) -> Optional[str]:
-    """Resolve Telegram file_id to file_path."""
     try:
         r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30)
-        print("getFile status:", r.status_code, "resp:", r.text[:500])
+        print("getFile status:", r.status_code, "resp:", r.text[:300])
         data = r.json()
         return data.get("result", {}).get("file_path")
     except Exception as e:
@@ -46,7 +52,6 @@ def tg_get_file_path(file_id: str) -> Optional[str]:
 
 
 def tg_download_file(file_path: str, dst_path: str) -> None:
-    """Download a file from Telegram file API to dst_path."""
     url = f"{TG_FILE_API}/{file_path}"
     with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
@@ -58,10 +63,6 @@ def tg_download_file(file_path: str, dst_path: str) -> None:
 
 # ====== Audio helpers ======
 def ffmpeg_to_mp3(src_path: str, dst_path: str) -> None:
-    """
-    Convert almost anything Telegram gives (ogg/opus, mp4, etc.) to mp3.
-    Requires ffmpeg installed in the container.
-    """
     subprocess.run(
         ["ffmpeg", "-y", "-i", src_path, "-vn", "-acodec", "libmp3lame", "-q:a", "4", dst_path],
         check=True,
@@ -71,14 +72,90 @@ def ffmpeg_to_mp3(src_path: str, dst_path: str) -> None:
 
 
 def transcribe_with_openai(audio_path: str) -> str:
-    """Transcribe audio using OpenAI transcription model."""
     with open(audio_path, "rb") as f:
         tr = client.audio.transcriptions.create(
             model="gpt-4o-transcribe",
             file=f,
-            # language="ru",  # uncomment if you want to force Russian
+            # language="ru",
         )
     return (tr.text or "").strip()
+
+
+# ====== GitHub helpers ======
+def parse_labels() -> List[str]:
+    labels = [x.strip() for x in GITHUB_LABELS.split(",") if x.strip()]
+    return labels
+
+
+def github_create_issue(title: str, body: str) -> str:
+    """
+    Returns issue HTML URL.
+    Requires GITHUB_TOKEN + GITHUB_REPO.
+    """
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        raise RuntimeError("GitHub is not configured (missing GITHUB_TOKEN or GITHUB_REPO).")
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload: Dict[str, Any] = {
+        "title": title,
+        "body": body,
+    }
+    labels = parse_labels()
+    if labels:
+        payload["labels"] = labels
+
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    if r.status_code >= 300:
+        raise RuntimeError(f"GitHub issue create failed {r.status_code}: {r.text[:500]}")
+
+    data = r.json()
+    return data["html_url"]
+
+
+# ====== Ticket formatting ======
+def make_issue_title_and_body(text: str, chat_id: int, user: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Simple heuristic: first line (or first sentence) becomes title.
+    You can later replace this with smarter parsing / templates.
+    """
+    clean = " ".join(text.split()).strip()
+
+    # Title: first 80 chars or up to first punctuation
+    title = clean
+    for sep in [". ", "! ", "? ", "\n"]:
+        if sep in title:
+            title = title.split(sep, 1)[0]
+            break
+    title = title[:80].strip()
+    if not title:
+        title = "Voice ticket"
+
+    username = user.get("username") or f'{user.get("first_name","")} {user.get("last_name","")}'.strip()
+    body = (
+        f"{clean}\n\n"
+        f"---\n"
+        f"Source: Telegram voice\n"
+        f"From: {username or 'unknown'}\n"
+        f"Chat ID: {chat_id}\n"
+    )
+    return {"title": title, "body": body}
+
+
+def show_confirmation(chat_id: int, text: str) -> None:
+    msg = (
+        "Вот что я распознал:\n\n"
+        f"“{text}”\n\n"
+        "Подтверждаешь создание GitHub Issue?\n"
+        "Ответь одним словом:\n"
+        "✅ *создать*  |  ✏️ *правка*  |  ❌ *отмена*\n"
+    )
+    # Telegram plain text only (без Markdown), чтобы не париться с экранированием
+    tg_send_message(chat_id, msg)
 
 
 # ====== Routes ======
@@ -91,41 +168,73 @@ def health():
 async def telegram_webhook(req: Request):
     update = await req.json()
 
-    # Debug: show what we got
-    print("UPDATE KEYS:", list(update.keys()))
-
     message = update.get("message") or update.get("edited_message")
     if not message:
         return {"ok": True}
 
-    print("MESSAGE KEYS:", list(message.keys()))
-
-    chat_id = message.get("chat", {}).get("id")
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
     if not chat_id:
-        print("No chat_id in message:", message)
         return {"ok": True}
 
-    # Identify message type
-    text = message.get("text")
-    voice = message.get("voice")  # Telegram voice message (usually ogg/opus)
-    audio = message.get("audio")  # Telegram audio file
-    document = message.get("document")  # sometimes users send audio as a document
+    user = message.get("from", {}) or {}
 
-    # 1) Text handling
+    text = (message.get("text") or "").strip()
+    voice = message.get("voice")
+    audio = message.get("audio")
+    document = message.get("document")
+
+    # ====== 0) Handle confirmation flow if we have pending state ======
+    if text and chat_id in PENDING:
+        state = PENDING[chat_id]
+        lower = text.lower()
+
+        if state["stage"] == "confirm":
+            if lower in ("создать", "да", "ок", "yes", "y", "✅"):
+                try:
+                    formatted = make_issue_title_and_body(state["text"], chat_id, user)
+                    url = github_create_issue(formatted["title"], formatted["body"])
+                    tg_send_message(chat_id, f"Готово. Issue создан:\n{url}")
+                except Exception as e:
+                    print("GitHub create error:", repr(e))
+                    tg_send_message(chat_id, f"Не смог создать issue: {type(e).__name__}\nПроверь GITHUB_TOKEN / GITHUB_REPO и права.")
+                finally:
+                    PENDING.pop(chat_id, None)
+                return {"ok": True}
+
+            if lower in ("правка", "редактировать", "edit", "✏️"):
+                state["stage"] = "edit"
+                tg_send_message(chat_id, "Ок. Пришли одним сообщением исправленный текст тикета.")
+                return {"ok": True}
+
+            if lower in ("отмена", "нет", "cancel", "❌"):
+                PENDING.pop(chat_id, None)
+                tg_send_message(chat_id, "Отменил. Ничего не отправляю в GitHub.")
+                return {"ok": True}
+
+            tg_send_message(chat_id, "Не понял ответ. Напиши: создать / правка / отмена.")
+            return {"ok": True}
+
+        if state["stage"] == "edit":
+            # User sent corrected text
+            state["text"] = text
+            state["stage"] = "confirm"
+            show_confirmation(chat_id, state["text"])
+            return {"ok": True}
+
+    # ====== 1) Plain text (no pending) ======
     if text and not (voice or audio or document):
-        help_text = (
-            "Я умею превращать голос/аудио в текст.\n\n"
-            "• Пришли голосовое (микрофон) или аудиофайл.\n"
-            "• Можно коротко, 5–60 сек.\n"
-        )
-        # You can also add commands:
-        if text.strip().lower() in ("/start", "start", "hi", "help", "/help"):
-            tg_send_message(chat_id, help_text)
+        if text.lower() in ("/start", "/help", "help", "старт"):
+            tg_send_message(
+                chat_id,
+                "Пришли голосовое — я переведу в текст и предложу создать GitHub Issue.\n"
+                "После распознавания ответь: создать / правка / отмена."
+            )
         else:
-            tg_send_message(chat_id, "Пришли голосовое или аудиофайл — верну текст 👂➡️📝")
+            tg_send_message(chat_id, "Пришли голосовое или аудиофайл. Текст я использую для подтверждения/правки.")
         return {"ok": True}
 
-    # 2) Audio/voice handling
+    # ====== 2) Voice/Audio handling ======
     file_id = None
     file_ext_hint = "ogg"
 
@@ -138,12 +247,11 @@ async def telegram_webhook(req: Request):
         file_ext_hint = "audio"
         tg_send_message(chat_id, "Принял аудио. Распознаю…")
     elif document and isinstance(document, dict):
-        # If user sent an audio file as "document", we try it too.
         mime = (document.get("mime_type") or "").lower()
         if mime.startswith("audio/") or mime in ("application/ogg", "video/mp4"):
             file_id = document.get("file_id")
             file_ext_hint = "doc"
-            tg_send_message(chat_id, "Принял файл. Пытаюсь распознать…")
+            tg_send_message(chat_id, "Принял файл. Распознаю…")
         else:
             tg_send_message(chat_id, "Вижу файл, но это не похоже на аудио. Пришли голосовое или аудиофайл 🙂")
             return {"ok": True}
@@ -167,7 +275,6 @@ async def telegram_webhook(req: Request):
 
             tg_download_file(file_path, src_path)
 
-            # Convert to mp3 (best compatibility)
             try:
                 ffmpeg_to_mp3(src_path, mp3_path)
                 audio_path = mp3_path
@@ -175,17 +282,15 @@ async def telegram_webhook(req: Request):
                 print("ffmpeg convert failed, using original:", repr(e))
                 audio_path = src_path
 
-            text_out = transcribe_with_openai(audio_path)
+            recognized = transcribe_with_openai(audio_path)
 
-        if not text_out:
+        if not recognized:
             tg_send_message(chat_id, "Не смог распознать (пусто). Попробуй записать ближе к микрофону.")
             return {"ok": True}
 
-        # Telegram message length safety
-        if len(text_out) > 3500:
-            text_out = text_out[:3500] + "…"
-
-        tg_send_message(chat_id, text_out)
+        # Save to pending and ask for confirmation
+        PENDING[chat_id] = {"stage": "confirm", "text": recognized}
+        show_confirmation(chat_id, recognized)
         return {"ok": True}
 
     except Exception as e:
