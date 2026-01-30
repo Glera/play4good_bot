@@ -1,4 +1,3 @@
-```python
 import os
 import re
 import time
@@ -671,4 +670,3 @@ async def telegram_webhook(req: Request):
     except Exception as e:
         tg_send_message(chat_id, f"Ошибка: {type(e).__name__}\n{e}", reply_to_message_id=message_id)
         return {"ok": True}
-```
