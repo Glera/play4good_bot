@@ -489,17 +489,14 @@ async def telegram_webhook(req: Request):
                 if state.get("branch_mode") == "new":
                     default_branch = gh_get_default_branch()
                 
-                    # имя автора для ветки
                     username = (
                         from_user.get("username")
                         or from_user.get("first_name")
-                        or f"user{from_user.get('id')}"
+                        or f"u{from_user.get('id')}"
                     )
-                    username_slug = slugify(username, max_len=20)
                 
-                    title_slug = slugify(issue_fmt["title"], max_len=30)
-                
-                    new_branch = f"ticket/{issue_number}-{username_slug}-{title_slug}"
+                    username_slug = slugify(username, max_len=20)  # кириллицу оставляем
+                    new_branch = f"ticket/{username_slug}-{issue_number}"
                 
                     gh_create_branch(new_branch, default_branch)
                     chosen_branch = new_branch
