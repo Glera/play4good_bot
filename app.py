@@ -238,15 +238,22 @@ def gh_update_issue(number: int, body: str) -> None:
 
 def gh_list_branches(page: int = 1, per_page: int = 10) -> List[str]:
     owner, repo = gh_repo_parts()
+    url = f"{GH_API}/repos/{owner}/{repo}/branches"
     r = requests.get(
-        f"{GH_API}/repos/{owner}/{repo}/branches",
+        url,
         headers=gh_headers(),
         params={"per_page": per_page, "page": page},
         timeout=30,
     )
+    print("GH branches GET", url, "status", r.status_code)
+    print("GH branches resp (first 300):", r.text[:300])
+
     if r.status_code >= 300:
-        raise RuntimeError(f"List branches failed {r.status_code}: {r.text[:300]}")
-    return [b["name"] for b in r.json()]
+        raise RuntimeError(f"List branches failed {r.status_code}: {r.text[:500]}")
+
+    data = r.json()
+    names = [b.get("name") for b in data if isinstance(b, dict)]
+    return [n for n in names if n]
 
 
 def format_issue(text: str, chat_id: int, user: dict) -> Dict[str, str]:
@@ -307,6 +314,11 @@ def show_confirmation(chat_id: int, author_id: int, state: Dict[str, Any], reply
 
 def show_branch_picker(chat_id: int, author_id: int, state: Dict[str, Any], reply_to_message_id: Optional[int] = None) -> None:
     page = int(state.get("branch_page") or 1)
+    try:
+        branches = gh_list_branches(page=page, per_page=10)
+    except Exception as e:
+        tg_send_message(chat_id, f"Не могу получить ветки из GitHub: {type(e).__name__}\n{e}", reply_to_message_id=reply_to_message_id)
+        return
     branches = gh_list_branches(page=page, per_page=10)
 
     kb: List[List[Dict[str, str]]] = []
