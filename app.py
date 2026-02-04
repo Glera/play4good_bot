@@ -608,7 +608,8 @@ async def telegram_webhook(req: Request):
     text = (msg.get("text") or "").strip()
 
     # Help
-    if text.lower() in ("/start", "/help", "help"):
+    cmd_base = text.lower().split("@")[0]
+    if cmd_base in ("/start", "/help", "help"):
         if in_group and REQUIRE_TICKET_COMMAND:
             tg_send_message(chat_id, "В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/apps — открыть приложения.", reply_to_message_id=message_id)
         else:
@@ -616,7 +617,7 @@ async def telegram_webhook(req: Request):
         return {"ok": True}
 
     # Apps menu
-    if text.lower() == "/apps":
+    if text.lower().split("@")[0] == "/apps":
         show_apps_menu(chat_id, reply_to_message_id=message_id)
         return {"ok": True}
 
