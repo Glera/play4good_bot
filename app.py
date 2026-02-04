@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import base64
 import tempfile
@@ -23,14 +22,48 @@ REQUIRE_TICKET_COMMAND = os.environ.get("REQUIRE_TICKET_COMMAND", "true").lower(
 ARM_TTL_SECONDS = int(os.environ.get("ARM_TTL_SECONDS", "120"))  # /ticket -> wait next voice within TTL
 
 # WebApp URLs (Netlify)
-WEBAPP_URL_PRODUCTION = os.environ.get("WEBAPP_URL_PRODUCTION", "")  # main branch
-WEBAPP_URL_DEV_1 = os.environ.get("WEBAPP_URL_DEV_1", "")           # dev branch #1
-WEBAPP_URL_DEV_2 = os.environ.get("WEBAPP_URL_DEV_2", "")           # dev branch #2
-WEBAPP_DEV_1_NAME = os.environ.get("WEBAPP_DEV_1_NAME", "Dev 1")    # display name
-WEBAPP_DEV_2_NAME = os.environ.get("WEBAPP_DEV_2_NAME", "Dev 2")    # display name
+def _ensure_https(url: str) -> str:
+    """Ensure URL has https:// prefix (required by Telegram WebApp)."""
+    url = url.strip()
+    if not url:
+        return ""
+    if not url.startswith(("https://", "http://")):
+        url = "https://" + url
+    return url
+
+WEBAPP_URL_PRODUCTION = _ensure_https(os.environ.get("WEBAPP_URL_PRODUCTION", ""))
+WEBAPP_URL_DEV_1 = _ensure_https(os.environ.get("WEBAPP_URL_DEV_1", ""))
+WEBAPP_URL_DEV_2 = _ensure_https(os.environ.get("WEBAPP_URL_DEV_2", ""))
+WEBAPP_DEV_1_NAME = os.environ.get("WEBAPP_DEV_1_NAME", "Dev 1")
+WEBAPP_DEV_2_NAME = os.environ.get("WEBAPP_DEV_2_NAME", "Dev 2")
+
+# Developer mapping: Telegram user_id → dev branch & label
+# Format: "tg_user_id1:branch1:label1,tg_user_id2:branch2:label2"
+# Example: "123456:dev/alice:developer:alice,789012:dev/bob:developer:bob"
+_DEV_MAP_RAW = os.environ.get("DEVELOPER_MAP", "")
+
+def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
+    result: Dict[int, Dict[str, str]] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":", 2)
+        if len(parts) < 3:
+            print(f"[WARN] Invalid DEVELOPER_MAP entry: {entry!r} (expected tg_id:branch:label)")
+            continue
+        try:
+            tg_id = int(parts[0])
+        except ValueError:
+            print(f"[WARN] Invalid tg_id in DEVELOPER_MAP: {parts[0]!r}")
+            continue
+        result[tg_id] = {"branch": parts[1], "label": parts[2]}
+    return result
+
+DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.3.0"  # ← bump this on every deploy to verify
+BOT_VERSION = "0.4.0"  # ← removed branch selection, auto-assign from DEVELOPER_MAP
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -47,6 +80,7 @@ print(f"[BOT] GITHUB_REPO={GITHUB_REPO} REQUIRE_TICKET_CMD={REQUIRE_TICKET_COMMA
 print(f"[BOT] WEBAPP_PROD={WEBAPP_URL_PRODUCTION or '(empty)'}")
 print(f"[BOT] WEBAPP_DEV1={WEBAPP_URL_DEV_1 or '(empty)'} ({WEBAPP_DEV_1_NAME})")
 print(f"[BOT] WEBAPP_DEV2={WEBAPP_URL_DEV_2 or '(empty)'} ({WEBAPP_DEV_2_NAME})")
+print(f"[BOT] DEVELOPER_MAP={DEVELOPER_MAP}")
 
 # ===== In-memory state. For production/multi-instance use Redis. =====
 # key = f"{chat_id}:{user_id}"
@@ -65,13 +99,6 @@ def state_key(chat_id: int, user_id: int) -> str:
 
 def now_ts() -> int:
     return int(time.time())
-
-
-def slugify(s: str, max_len: int = 40) -> str:
-    s = s.lower().strip()
-    s = re.sub(r"[^a-z0-9а-яё]+", "-", s, flags=re.IGNORECASE)
-    s = re.sub(r"-{2,}", "-", s).strip("-")
-    return s[:max_len] or "ticket"
 
 
 def parse_labels() -> List[str]:
@@ -194,26 +221,10 @@ def gh_get_default_branch() -> str:
     return r.json()["default_branch"]
 
 
-def gh_get_branch_sha(branch: str) -> str:
-    owner, repo = gh_repo_parts()
-    r = requests.get(f"{GH_API}/repos/{owner}/{repo}/git/ref/heads/{branch}", headers=gh_headers(), timeout=30)
-    r.raise_for_status()
-    return r.json()["object"]["sha"]
-
-
 def gh_branch_exists(branch: str) -> bool:
     owner, repo = gh_repo_parts()
     r = requests.get(f"{GH_API}/repos/{owner}/{repo}/git/ref/heads/{branch}", headers=gh_headers(), timeout=15)
     return r.status_code == 200
-
-
-def gh_create_branch(new_branch: str, from_branch: str) -> None:
-    owner, repo = gh_repo_parts()
-    base_sha = gh_get_branch_sha(from_branch)
-    payload = {"ref": f"refs/heads/{new_branch}", "sha": base_sha}
-    r = requests.post(f"{GH_API}/repos/{owner}/{repo}/git/refs", headers=gh_headers(), json=payload, timeout=30)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Create branch failed {r.status_code}: {r.text[:500]}")
 
 
 def gh_put_file(branch: str, path: str, content_bytes: bytes, message: str) -> str:
@@ -234,10 +245,12 @@ def gh_put_file(branch: str, path: str, content_bytes: bytes, message: str) -> s
     return data["content"]["html_url"]
 
 
-def gh_create_issue(title: str, body: str) -> Dict[str, Any]:
+def gh_create_issue(title: str, body: str, extra_labels: Optional[List[str]] = None) -> Dict[str, Any]:
     owner, repo = gh_repo_parts()
     payload: Dict[str, Any] = {"title": title, "body": body}
     labels = parse_labels()
+    if extra_labels:
+        labels.extend(extra_labels)
     if labels:
         payload["labels"] = labels
 
@@ -259,27 +272,7 @@ def gh_update_issue(number: int, body: str) -> None:
         raise RuntimeError(f"Update issue failed {r.status_code}: {r.text[:500]}")
 
 
-def gh_list_branches(page: int = 1, per_page: int = 10) -> List[str]:
-    owner, repo = gh_repo_parts()
-    url = f"{GH_API}/repos/{owner}/{repo}/branches"
-    r = requests.get(
-        url,
-        headers=gh_headers(),
-        params={"per_page": per_page, "page": page},
-        timeout=30,
-    )
-    print("GH branches GET", url, "status", r.status_code)
-    print("GH branches resp (first 300):", r.text[:300])
-
-    if r.status_code >= 300:
-        raise RuntimeError(f"List branches failed {r.status_code}: {r.text[:500]}")
-
-    data = r.json()
-    names = [b.get("name") for b in data if isinstance(b, dict)]
-    return [n for n in names if n]
-
-
-def format_issue(text: str, chat_id: int, user: dict) -> Dict[str, str]:
+def format_issue(text: str, chat_id: int, user: dict, dev_info: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     clean = " ".join(text.split()).strip()
     title = clean
     for sep in [". ", "! ", "? ", "\n"]:
@@ -289,30 +282,25 @@ def format_issue(text: str, chat_id: int, user: dict) -> Dict[str, str]:
     title = title[:80].strip() or "Voice ticket"
 
     username = user.get("username") or f'{user.get("first_name","")} {user.get("last_name","")}'.strip()
-    body = (
-        f"{clean}\n\n---\n"
-        f"Source: Telegram\n"
-        f"From: {username or 'unknown'}\n"
-        f"Chat ID: {chat_id}\n"
-    )
+    body = f"@claude\n\n{clean}\n\n---\n"
+    body += f"Source: Telegram\n"
+    body += f"From: {username or 'unknown'}\n"
+    body += f"Chat ID: {chat_id}\n"
+    if dev_info:
+        body += f"Developer: {dev_info['label']}\n"
+        body += f"Target branch: `{dev_info['branch']}`\n"
     return {"title": title, "body": body}
 
 
 # ===================== UI / FLOW =====================
 def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None) -> None:
-    """Send inline keyboard with WebApp buttons for all three environments."""
+    """Send inline keyboard with WebApp buttons for dev/test environments."""
     print(f"[APPS] show_apps_menu called for chat={chat_id}")
-    print(f"[APPS] WEBAPP_URL_PRODUCTION={WEBAPP_URL_PRODUCTION!r}")
     print(f"[APPS] WEBAPP_URL_DEV_1={WEBAPP_URL_DEV_1!r}")
     print(f"[APPS] WEBAPP_URL_DEV_2={WEBAPP_URL_DEV_2!r}")
 
     keyboard: List[List[Dict[str, Any]]] = []
 
-    if WEBAPP_URL_PRODUCTION:
-        keyboard.append([{
-            "text": f"\U0001f7e2 Основное приложение",
-            "web_app": {"url": WEBAPP_URL_PRODUCTION},
-        }])
     if WEBAPP_URL_DEV_1:
         keyboard.append([{
             "text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}",
@@ -325,14 +313,14 @@ def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None) -> N
         }])
 
     if not keyboard:
-        print("[APPS] No URLs configured — sending error message")
-        tg_send_message(chat_id, "WebApp URLs не настроены. Задайте WEBAPP_URL_* в env.", reply_to_message_id=reply_to_message_id)
+        print("[APPS] No dev URLs configured — sending error message")
+        tg_send_message(chat_id, "Dev URLs не настроены. Задайте WEBAPP_URL_DEV_* в env.", reply_to_message_id=reply_to_message_id)
         return
 
     print(f"[APPS] Sending keyboard with {len(keyboard)} buttons")
     resp = tg_send_message_with_keyboard(
         chat_id,
-        "Выбери приложение:",
+        "Тестовые приложения:",
         keyboard,
         reply_to_message_id=reply_to_message_id,
     )
@@ -341,17 +329,14 @@ def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None) -> N
 
 def confirmation_text(state: Dict[str, Any]) -> str:
     screenshot = state.get("screenshot")
-    branch_mode = state.get("branch_mode")  # "new"|"existing"|None
-    branch_name = state.get("branch_name")
+    dev_info = state.get("dev_info")
 
     meta = []
     meta.append(f"Скриншот: {'✅ есть' if screenshot else '— нет'}")
-    if branch_mode == "new":
-        meta.append("Ветка: 🌱 новая")
-    elif branch_mode == "existing":
-        meta.append(f"Ветка: ↩️ существующая ({branch_name or 'не выбрана'})")
+    if dev_info:
+        meta.append(f"Ветка: {dev_info['branch']}")
     else:
-        meta.append("Ветка: — не выбрана")
+        meta.append("Ветка: default (разработчик не привязан)")
 
     return (
         "Вот что я распознал:\n\n"
@@ -367,44 +352,9 @@ def show_confirmation(chat_id: int, author_id: int, state: Dict[str, Any], reply
         [{"text": "✅ Создать issue", "callback_data": f"create:{author_id}"}],
         [{"text": "✏️ Правка текста", "callback_data": f"edit:{author_id}"}],
         [{"text": "📎 Скриншот", "callback_data": f"shot:{author_id}"}],
-        [{"text": "🌱 Новая ветка", "callback_data": f"branch_new:{author_id}"}],
-        [{"text": "↩️ Выбрать ветку", "callback_data": f"branch_pick:{author_id}"}],
-        [{"text": "🔎 Ввести ветку вручную", "callback_data": f"branch_manual:{author_id}"}],
         [{"text": "❌ Отмена", "callback_data": f"cancel:{author_id}"}],
     ]
     tg_send_message_with_keyboard(chat_id, confirmation_text(state), keyboard, reply_to_message_id=reply_to_message_id)
-
-
-def show_branch_picker(chat_id: int, author_id: int, state: Dict[str, Any], reply_to_message_id: Optional[int] = None) -> None:
-    page = int(state.get("branch_page") or 1)
-    try:
-        branches = gh_list_branches(page=page, per_page=10)
-    except Exception as e:
-        tg_send_message(chat_id, f"Не могу получить ветки из GitHub: {type(e).__name__}\n{e}", reply_to_message_id=reply_to_message_id)
-        return
-    branches = gh_list_branches(page=page, per_page=10)
-
-    kb: List[List[Dict[str, str]]] = []
-    if not branches:
-        kb.append([{"text": "↩️ Назад", "callback_data": f"back_confirm:{author_id}"}])
-        tg_send_message_with_keyboard(chat_id, "Веток не найдено (или страница пустая).", kb, reply_to_message_id=reply_to_message_id)
-        return
-
-    for name in branches:
-        # callback_data size is limited; branch names are usually short enough
-        kb.append([{"text": name, "callback_data": f"pick:{author_id}:{name}"}])
-
-    nav_row: List[Dict[str, str]] = []
-    if page > 1:
-        nav_row.append({"text": "⬅️ Prev", "callback_data": f"branch_prev:{author_id}"})
-    nav_row.append({"text": f"Page {page}", "callback_data": f"noop:{author_id}"})
-    nav_row.append({"text": "Next ➡️", "callback_data": f"branch_next:{author_id}"})
-    kb.append(nav_row)
-
-    kb.append([{"text": "🔎 Ввести вручную", "callback_data": f"branch_manual:{author_id}"}])
-    kb.append([{"text": "↩️ Назад", "callback_data": f"back_confirm:{author_id}"}])
-
-    tg_send_message_with_keyboard(chat_id, "Выбери существующую ветку:", kb, reply_to_message_id=reply_to_message_id)
 
 
 def extract_image_from_message(msg: dict) -> Optional[Dict[str, Any]]:
@@ -508,93 +458,31 @@ async def telegram_webhook(req: Request):
             tg_send_message(chat_id, "Ок. Пришли скриншот (картинку) одним сообщением.", reply_to_message_id=reply_to_id)
             return {"ok": True}
 
-        if action == "branch_new":
-            state["branch_mode"] = "new"
-            state["branch_name"] = None
-            state["stage"] = "confirm"
-            show_confirmation(chat_id, author_id, state, reply_to_message_id=reply_to_id)
-            return {"ok": True}
-
-        if action == "branch_pick":
-            state["branch_mode"] = "existing"
-            state["stage"] = "pick_branch"
-            state["branch_page"] = int(state.get("branch_page") or 1)
-            show_branch_picker(chat_id, author_id, state, reply_to_message_id=reply_to_id)
-            return {"ok": True}
-
-        if action == "branch_next":
-            state["branch_page"] = int(state.get("branch_page") or 1) + 1
-            show_branch_picker(chat_id, author_id, state, reply_to_message_id=reply_to_id)
-            return {"ok": True}
-
-        if action == "branch_prev":
-            state["branch_page"] = max(1, int(state.get("branch_page") or 1) - 1)
-            show_branch_picker(chat_id, author_id, state, reply_to_message_id=reply_to_id)
-            return {"ok": True}
-
-        if action == "branch_manual":
-            state["branch_mode"] = "existing"
-            state["stage"] = "await_branch_name"
-            tg_send_message(chat_id, "Напиши название ветки (например: feature/ui-fix).", reply_to_message_id=reply_to_id)
-            return {"ok": True}
-
-        if action == "back_confirm":
-            state["stage"] = "confirm"
-            show_confirmation(chat_id, author_id, state, reply_to_message_id=reply_to_id)
-            return {"ok": True}
-
-        if action == "pick":
-            branch_name = extra.strip()
-            state["branch_mode"] = "existing"
-            state["branch_name"] = branch_name
-            state["stage"] = "confirm"
-            show_confirmation(chat_id, author_id, state, reply_to_message_id=reply_to_id)
-            return {"ok": True}
-
         if action == "create":
             try:
-                issue_fmt = format_issue(state["text"], chat_id, from_user)
-                issue = gh_create_issue(issue_fmt["title"], issue_fmt["body"])
+                dev_info = DEVELOPER_MAP.get(clicker_id)
+                extra_labels: List[str] = []
+                if dev_info:
+                    extra_labels.append(dev_info["label"])
+                    print(f"[CREATE] Developer: user={clicker_id} → branch={dev_info['branch']} label={dev_info['label']}")
+                else:
+                    print(f"[CREATE] No developer mapping for user={clicker_id}, using default branch")
+
+                issue_fmt = format_issue(state["text"], chat_id, from_user, dev_info=dev_info)
+                issue = gh_create_issue(issue_fmt["title"], issue_fmt["body"], extra_labels=extra_labels)
                 issue_url = issue["html_url"]
                 issue_number = issue["number"]
                 issue_body = issue_fmt["body"]
 
-                branch_info = ""
+                # Branch from developer mapping or default
+                chosen_branch: Optional[str] = dev_info["branch"] if dev_info else None
+                branch_info = f"\nBranch: `{chosen_branch}`" if chosen_branch else ""
                 screenshot_info = ""
-                chosen_branch: Optional[str] = None
-                default_branch = None
 
-                if state.get("branch_mode") == "new":
-                    default_branch = gh_get_default_branch()
-                
-                    username = (
-                        from_user.get("username")
-                        or from_user.get("first_name")
-                        or f"u{from_user.get('id')}"
-                    )
-                
-                    username_slug = slugify(username, max_len=20)  # кириллицу оставляем
-                    new_branch = f"ticket/{username_slug}-{issue_number}"
-                
-                    gh_create_branch(new_branch, default_branch)
-                    chosen_branch = new_branch
-                    branch_info = f"\nBranch: `{new_branch}`"
-
-                elif state.get("branch_mode") == "existing":
-                    bn = (state.get("branch_name") or "").strip()
-                    if not bn:
-                        tg_send_message(chat_id, "Ветка не указана. Выбери ветку и попробуй снова.", reply_to_message_id=reply_to_id)
-                        return {"ok": True}
-                    if not gh_branch_exists(bn):
-                        tg_send_message(chat_id, f"Ветка `{bn}` не найдена.", reply_to_message_id=reply_to_id)
-                        return {"ok": True}
-                    chosen_branch = bn
-                    branch_info = f"\nBranch: `{bn}`"
-
+                # Upload screenshot if present
                 if state.get("screenshot"):
                     if not chosen_branch:
-                        default_branch = default_branch or gh_get_default_branch()
-                        chosen_branch = default_branch
+                        chosen_branch = gh_get_default_branch()
                         branch_info = f"\nBranch: `{chosen_branch}` (default)"
 
                     shot = state["screenshot"]
@@ -613,8 +501,9 @@ async def telegram_webhook(req: Request):
                     )
                     screenshot_info = f"\nScreenshot: {html_url}"
 
-                updated_body = issue_body + "\n\n---\n" + (branch_info + screenshot_info).strip()
-                gh_update_issue(issue_number, updated_body)
+                if branch_info or screenshot_info:
+                    updated_body = issue_body + "\n\n---\n" + (branch_info + screenshot_info).strip()
+                    gh_update_issue(issue_number, updated_body)
 
                 tg_send_message(chat_id, f"Готово 🎉\nIssue: {issue_url}", reply_to_message_id=reply_to_id)
 
@@ -678,21 +567,18 @@ async def telegram_webhook(req: Request):
             f"WEBAPP_DEV1: {'✅' if WEBAPP_URL_DEV_1 else '❌'} {WEBAPP_DEV_1_NAME}\n"
             f"WEBAPP_DEV2: {'✅' if WEBAPP_URL_DEV_2 else '❌'} {WEBAPP_DEV_2_NAME}\n"
             f"REQUIRE_TICKET_CMD: {REQUIRE_TICKET_COMMAND}\n"
-            f"Group chat: {in_group}"
+            f"Group chat: {in_group}\n"
+            f"---\n"
+            f"Your user_id: {user_id}\n"
+            f"Your dev mapping: {DEVELOPER_MAP.get(user_id, 'not mapped')}\n"
+            f"Total devs mapped: {len(DEVELOPER_MAP)}"
         )
         tg_send_message(chat_id, debug_text, reply_to_message_id=message_id)
         return {"ok": True}
 
-    # If pending exists: allow edit, branch name, screenshot image anytime
+    # If pending exists: allow edit and screenshot
     if key in PENDING:
         state = PENDING[key]
-
-        # branch name input
-        if state.get("stage") == "await_branch_name" and text:
-            state["branch_name"] = text.strip()
-            state["stage"] = "confirm"
-            show_confirmation(chat_id, user_id, state, reply_to_message_id=message_id)
-            return {"ok": True}
 
         # screenshot input (photo or image doc)
         img = extract_image_from_message(msg)
@@ -714,14 +600,13 @@ async def telegram_webhook(req: Request):
         is_cmd, rest = extract_ticket_command(text)
         if is_cmd and rest:
             # Text ticket
+            dev_info = DEVELOPER_MAP.get(user_id)
             PENDING[key] = {
                 "stage": "confirm",
                 "text": rest,
                 "ts": now_ts(),
                 "screenshot": None,
-                "branch_mode": None,
-                "branch_name": None,
-                "branch_page": 1,
+                "dev_info": dev_info,
             }
             show_confirmation(chat_id, user_id, PENDING[key], reply_to_message_id=message_id)
             return {"ok": True}
@@ -783,14 +668,13 @@ async def telegram_webhook(req: Request):
         # consume arm
         ARMED.pop(key, None)
 
+        dev_info = DEVELOPER_MAP.get(user_id)
         PENDING[key] = {
             "stage": "confirm",
             "text": recognized,
             "ts": now_ts(),
             "screenshot": None,
-            "branch_mode": None,
-            "branch_name": None,
-            "branch_page": 1,
+            "dev_info": dev_info,
         }
         show_confirmation(chat_id, user_id, PENDING[key], reply_to_message_id=message_id)
         return {"ok": True}
