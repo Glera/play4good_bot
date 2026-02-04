@@ -63,7 +63,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.4.0"  # ← removed branch selection, auto-assign from DEVELOPER_MAP
+BOT_VERSION = "0.5.0"  # ← added /reset command
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -225,6 +225,30 @@ def gh_branch_exists(branch: str) -> bool:
     owner, repo = gh_repo_parts()
     r = requests.get(f"{GH_API}/repos/{owner}/{repo}/git/ref/heads/{branch}", headers=gh_headers(), timeout=15)
     return r.status_code == 200
+
+
+def gh_get_branch_sha(branch: str) -> str:
+    """Get the latest commit SHA of a branch."""
+    owner, repo = gh_repo_parts()
+    r = requests.get(f"{GH_API}/repos/{owner}/{repo}/git/ref/heads/{branch}", headers=gh_headers(), timeout=15)
+    r.raise_for_status()
+    return r.json()["object"]["sha"]
+
+
+def gh_force_reset_branch(branch: str, to_branch: str = "main") -> str:
+    """Force-update branch to point at the same commit as to_branch.
+    Returns the SHA it was reset to."""
+    owner, repo = gh_repo_parts()
+    target_sha = gh_get_branch_sha(to_branch)
+    r = requests.patch(
+        f"{GH_API}/repos/{owner}/{repo}/git/refs/heads/{branch}",
+        headers=gh_headers(),
+        json={"sha": target_sha, "force": True},
+        timeout=30,
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Force reset failed {r.status_code}: {r.text[:500]}")
+    return target_sha
 
 
 def gh_put_file(branch: str, path: str, content_bytes: bytes, message: str) -> str:
@@ -431,7 +455,28 @@ async def telegram_webhook(req: Request):
         extra = ":".join(parts[2:]) if len(parts) > 2 else ""
 
         if clicker_id != author_id:
-            tg_answer_callback(cb_id, text="Это не твой черновик 🙂", show_alert=False)
+            tg_answer_callback(cb_id, text="Это не твои кнопки 🙂", show_alert=False)
+            return {"ok": True}
+
+        # Reset branch handlers (не зависят от PENDING)
+        if action == "reset_confirm":
+            dev_info = DEVELOPER_MAP.get(clicker_id)
+            if not dev_info:
+                tg_send_message(chat_id, "Dev-ветка не найдена.", reply_to_message_id=reply_to_id)
+                return {"ok": True}
+            branch = dev_info["branch"]
+            try:
+                sha = gh_force_reset_branch(branch, "main")
+                short_sha = sha[:7]
+                print(f"[RESET] user={clicker_id} branch={branch} → main ({short_sha})")
+                tg_send_message(chat_id, f"✅ Ветка `{branch}` сброшена до `main` ({short_sha}).", reply_to_message_id=reply_to_id)
+            except Exception as e:
+                print(f"[RESET] ERROR user={clicker_id} branch={branch}: {e}")
+                tg_send_message(chat_id, f"❌ Ошибка: {type(e).__name__}\n{e}", reply_to_message_id=reply_to_id)
+            return {"ok": True}
+
+        if action == "reset_cancel":
+            tg_send_message(chat_id, "Отменил сброс.", reply_to_message_id=reply_to_id)
             return {"ok": True}
 
         key = state_key(chat_id, author_id)
@@ -539,9 +584,9 @@ async def telegram_webhook(req: Request):
     cmd_base = text.lower().split("@")[0]
     if cmd_base in ("/start", "/help", "help"):
         if in_group and REQUIRE_TICKET_COMMAND:
-            tg_send_message(chat_id, "В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/apps — открыть приложения.", reply_to_message_id=message_id)
+            tg_send_message(chat_id, "В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/apps — открыть приложения\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
         else:
-            tg_send_message(chat_id, "Пришли голосовое (или /ticket <текст>) — я создам GitHub Issue.\n/apps — открыть приложения.", reply_to_message_id=message_id)
+            tg_send_message(chat_id, "Пришли голосовое (или /ticket <текст>) — я создам GitHub Issue.\n/apps — открыть приложения\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
         return {"ok": True}
 
     # Apps menu
@@ -574,6 +619,26 @@ async def telegram_webhook(req: Request):
             f"Total devs mapped: {len(DEVELOPER_MAP)}"
         )
         tg_send_message(chat_id, debug_text, reply_to_message_id=message_id)
+        return {"ok": True}
+
+    # Reset dev branch to main
+    if cmd_base == "/reset":
+        dev_info = DEVELOPER_MAP.get(user_id)
+        if not dev_info:
+            tg_send_message(chat_id, "У тебя нет привязанной dev-ветки. Проверь DEVELOPER_MAP.", reply_to_message_id=message_id)
+            return {"ok": True}
+        branch = dev_info["branch"]
+        keyboard = [
+            [{"text": f"⚠️ Да, перезатереть {branch}", "callback_data": f"reset_confirm:{user_id}"}],
+            [{"text": "Отмена", "callback_data": f"reset_cancel:{user_id}"}],
+        ]
+        tg_send_message_with_keyboard(
+            chat_id,
+            f"Ты уверен? Ветка `{branch}` будет полностью заменена на текущий `main`.\n\n"
+            f"Все незамерженные изменения в `{branch}` будут потеряны!",
+            keyboard,
+            reply_to_message_id=message_id,
+        )
         return {"ok": True}
 
     # If pending exists: allow edit and screenshot
