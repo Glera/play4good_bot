@@ -22,6 +22,13 @@ GITHUB_LABELS = os.environ.get("GITHUB_LABELS", "")
 REQUIRE_TICKET_COMMAND = os.environ.get("REQUIRE_TICKET_COMMAND", "true").lower() in ("1", "true", "yes", "y")
 ARM_TTL_SECONDS = int(os.environ.get("ARM_TTL_SECONDS", "120"))  # /ticket -> wait next voice within TTL
 
+# WebApp URLs (Netlify)
+WEBAPP_URL_PRODUCTION = os.environ.get("WEBAPP_URL_PRODUCTION", "")  # main branch
+WEBAPP_URL_DEV_1 = os.environ.get("WEBAPP_URL_DEV_1", "")           # dev branch #1
+WEBAPP_URL_DEV_2 = os.environ.get("WEBAPP_URL_DEV_2", "")           # dev branch #2
+WEBAPP_DEV_1_NAME = os.environ.get("WEBAPP_DEV_1_NAME", "Dev 1")    # display name
+WEBAPP_DEV_2_NAME = os.environ.get("WEBAPP_DEV_2_NAME", "Dev 2")    # display name
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -276,6 +283,38 @@ def format_issue(text: str, chat_id: int, user: dict) -> Dict[str, str]:
 
 
 # ===================== UI / FLOW =====================
+def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None) -> None:
+    """Send inline keyboard with WebApp buttons for all three environments."""
+    keyboard: List[List[Dict[str, Any]]] = []
+
+    if WEBAPP_URL_PRODUCTION:
+        keyboard.append([{
+            "text": f"\U0001f7e2 Основное приложение",
+            "web_app": {"url": WEBAPP_URL_PRODUCTION},
+        }])
+    if WEBAPP_URL_DEV_1:
+        keyboard.append([{
+            "text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}",
+            "web_app": {"url": WEBAPP_URL_DEV_1},
+        }])
+    if WEBAPP_URL_DEV_2:
+        keyboard.append([{
+            "text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}",
+            "web_app": {"url": WEBAPP_URL_DEV_2},
+        }])
+
+    if not keyboard:
+        tg_send_message(chat_id, "WebApp URLs не настроены. Задайте WEBAPP_URL_* в env.", reply_to_message_id=reply_to_message_id)
+        return
+
+    tg_send_message_with_keyboard(
+        chat_id,
+        "Выбери приложение:",
+        keyboard,
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
 def confirmation_text(state: Dict[str, Any]) -> str:
     screenshot = state.get("screenshot")
     branch_mode = state.get("branch_mode")  # "new"|"existing"|None
@@ -292,7 +331,7 @@ def confirmation_text(state: Dict[str, Any]) -> str:
 
     return (
         "Вот что я распознал:\n\n"
-        f"“{state['text']}”\n\n"
+        f""{state['text']}"\n\n"
         + " | ".join(meta)
         + "\n\n"
         "Что делаем?"
@@ -571,9 +610,14 @@ async def telegram_webhook(req: Request):
     # Help
     if text.lower() in ("/start", "/help", "help"):
         if in_group and REQUIRE_TICKET_COMMAND:
-            tg_send_message(chat_id, "В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.", reply_to_message_id=message_id)
+            tg_send_message(chat_id, "В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/apps — открыть приложения.", reply_to_message_id=message_id)
         else:
-            tg_send_message(chat_id, "Пришли голосовое (или /ticket <текст>) — я создам GitHub Issue.", reply_to_message_id=message_id)
+            tg_send_message(chat_id, "Пришли голосовое (или /ticket <текст>) — я создам GitHub Issue.\n/apps — открыть приложения.", reply_to_message_id=message_id)
+        return {"ok": True}
+
+    # Apps menu
+    if text.lower() == "/apps":
+        show_apps_menu(chat_id, reply_to_message_id=message_id)
         return {"ok": True}
 
     # If pending exists: allow edit, branch name, screenshot image anytime
