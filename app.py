@@ -331,10 +331,10 @@ def confirmation_text(state: Dict[str, Any]) -> str:
 
     return (
         "Вот что я распознал:\n\n"
-        f""{state['text']}"\n\n"
+        + f"\u201c{state['text']}\u201d\n\n"
         + " | ".join(meta)
         + "\n\n"
-        "Что делаем?"
+        + "Что делаем?"
     )
 
 
