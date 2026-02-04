@@ -29,6 +29,11 @@ WEBAPP_URL_DEV_2 = os.environ.get("WEBAPP_URL_DEV_2", "")           # dev branch
 WEBAPP_DEV_1_NAME = os.environ.get("WEBAPP_DEV_1_NAME", "Dev 1")    # display name
 WEBAPP_DEV_2_NAME = os.environ.get("WEBAPP_DEV_2_NAME", "Dev 2")    # display name
 
+# Debug / versioning
+BOT_VERSION = "0.3.0"  # ← bump this on every deploy to verify
+BOT_STARTED_AT = int(time.time())
+BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -36,6 +41,12 @@ TG_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 GH_API = "https://api.github.com"
 
 app = FastAPI()
+
+print(f"[BOT] version={BOT_VERSION} build={BUILD_ID} started_at={BOT_STARTED_AT}")
+print(f"[BOT] GITHUB_REPO={GITHUB_REPO} REQUIRE_TICKET_CMD={REQUIRE_TICKET_COMMAND}")
+print(f"[BOT] WEBAPP_PROD={WEBAPP_URL_PRODUCTION or '(empty)'}")
+print(f"[BOT] WEBAPP_DEV1={WEBAPP_URL_DEV_1 or '(empty)'} ({WEBAPP_DEV_1_NAME})")
+print(f"[BOT] WEBAPP_DEV2={WEBAPP_URL_DEV_2 or '(empty)'} ({WEBAPP_DEV_2_NAME})")
 
 # ===== In-memory state. For production/multi-instance use Redis. =====
 # key = f"{chat_id}:{user_id}"
@@ -91,7 +102,7 @@ def tg_send_message_with_keyboard(
     text: str,
     keyboard: List[List[Dict[str, str]]],
     reply_to_message_id: Optional[int] = None,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
@@ -100,7 +111,12 @@ def tg_send_message_with_keyboard(
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = reply_to_message_id
         payload["allow_sending_without_reply"] = True
-    requests.post(f"{TG_API}/sendMessage", json=payload, timeout=30)
+    r = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=30)
+    resp = r.json()
+    if not resp.get("ok"):
+        print(f"[TG ERROR] sendMessage failed: {resp.get('error_code')} {resp.get('description')}")
+        print(f"[TG ERROR] payload keys: {list(payload.keys())}, keyboard_rows: {len(keyboard)}")
+    return resp
 
 
 def tg_answer_callback(callback_id: str, text: Optional[str] = None, show_alert: bool = False) -> None:
@@ -285,6 +301,11 @@ def format_issue(text: str, chat_id: int, user: dict) -> Dict[str, str]:
 # ===================== UI / FLOW =====================
 def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None) -> None:
     """Send inline keyboard with WebApp buttons for all three environments."""
+    print(f"[APPS] show_apps_menu called for chat={chat_id}")
+    print(f"[APPS] WEBAPP_URL_PRODUCTION={WEBAPP_URL_PRODUCTION!r}")
+    print(f"[APPS] WEBAPP_URL_DEV_1={WEBAPP_URL_DEV_1!r}")
+    print(f"[APPS] WEBAPP_URL_DEV_2={WEBAPP_URL_DEV_2!r}")
+
     keyboard: List[List[Dict[str, Any]]] = []
 
     if WEBAPP_URL_PRODUCTION:
@@ -304,15 +325,18 @@ def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None) -> N
         }])
 
     if not keyboard:
+        print("[APPS] No URLs configured — sending error message")
         tg_send_message(chat_id, "WebApp URLs не настроены. Задайте WEBAPP_URL_* в env.", reply_to_message_id=reply_to_message_id)
         return
 
-    tg_send_message_with_keyboard(
+    print(f"[APPS] Sending keyboard with {len(keyboard)} buttons")
+    resp = tg_send_message_with_keyboard(
         chat_id,
         "Выбери приложение:",
         keyboard,
         reply_to_message_id=reply_to_message_id,
     )
+    print(f"[APPS] TG response ok={resp.get('ok') if resp else 'None'}")
 
 
 def confirmation_text(state: Dict[str, Any]) -> str:
@@ -401,12 +425,27 @@ def extract_image_from_message(msg: dict) -> Optional[Dict[str, Any]]:
 # ===================== ROUTES =====================
 @app.get("/")
 def health():
-    return {"ok": True}
+    uptime = int(time.time()) - BOT_STARTED_AT
+    return {
+        "ok": True,
+        "version": BOT_VERSION,
+        "build": BUILD_ID,
+        "uptime_sec": uptime,
+    }
 
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
     update = await req.json()
+
+    # ---------- DEBUG LOG ----------
+    update_id = update.get("update_id", "?")
+    msg = update.get("message") or update.get("callback_query", {}).get("message") or {}
+    chat_id_log = msg.get("chat", {}).get("id", "?")
+    text_log = (msg.get("text") or "")[:50]
+    has_voice = bool(msg.get("voice") or msg.get("audio"))
+    has_cb = "callback_query" in update
+    print(f"[UPD {update_id}] chat={chat_id_log} text={text_log!r} voice={has_voice} cb={has_cb}")
 
     # ---------- CALLBACK QUERIES ----------
     if "callback_query" in update:
@@ -617,8 +656,31 @@ async def telegram_webhook(req: Request):
         return {"ok": True}
 
     # Apps menu
-    if text.lower().split("@")[0] == "/apps":
+    if cmd_base == "/apps":
+        print(f"[CMD] /apps from user={user_id} chat={chat_id} group={in_group}")
         show_apps_menu(chat_id, reply_to_message_id=message_id)
+        return {"ok": True}
+
+    # Debug info
+    if cmd_base == "/debug":
+        uptime = int(time.time()) - BOT_STARTED_AT
+        mins = uptime // 60
+        debug_text = (
+            f"🔧 Bot debug\n"
+            f"Version: {BOT_VERSION}\n"
+            f"Build: {BUILD_ID}\n"
+            f"Uptime: {mins}m {uptime % 60}s\n"
+            f"Pending tickets: {len(PENDING)}\n"
+            f"Armed users: {len(ARMED)}\n"
+            f"---\n"
+            f"GITHUB_REPO: {GITHUB_REPO or '(empty)'}\n"
+            f"WEBAPP_PROD: {'✅' if WEBAPP_URL_PRODUCTION else '❌'}\n"
+            f"WEBAPP_DEV1: {'✅' if WEBAPP_URL_DEV_1 else '❌'} {WEBAPP_DEV_1_NAME}\n"
+            f"WEBAPP_DEV2: {'✅' if WEBAPP_URL_DEV_2 else '❌'} {WEBAPP_DEV_2_NAME}\n"
+            f"REQUIRE_TICKET_CMD: {REQUIRE_TICKET_COMMAND}\n"
+            f"Group chat: {in_group}"
+        )
+        tg_send_message(chat_id, debug_text, reply_to_message_id=message_id)
         return {"ok": True}
 
     # If pending exists: allow edit, branch name, screenshot image anytime
