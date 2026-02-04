@@ -451,6 +451,15 @@ async def github_notify(req: Request):
 
     if event == "claude_started":
         tg_send_html(chat_id, f"🤖 Claude начал работу\n\n#{issue_number}: {issue_title}\nВетка: {branch}")
+    elif event == "opus_unavailable":
+        tg_send_html(chat_id,
+            f"⚠️ Opus недоступен, переключаюсь на Sonnet\n\n"
+            f"#{issue_number}: {issue_title}")
+    elif event == "claude_failed":
+        tg_send_html(chat_id,
+            f"❌ Claude упал при работе над задачей (3 попытки)\n\n"
+            f"#{issue_number}: {issue_title}\n\n"
+            f"Попробуй создать тикет ещё раз.")
     elif event == "merged":
         tg_send_html(chat_id, f"📦 Изменения в ветке {branch}\n\n#{issue_number}: {issue_title}\n\nОжидаем деплой...")
     else:
@@ -660,7 +669,7 @@ async def telegram_webhook(req: Request):
                     f"📋 Тикет создан!\n\n"
                     f"#{issue_number}: {issue_fmt['title']}\n"
                     f"{issue_url}\n\n"
-                    f"Claude скоро начнёт работу...",
+                    f"Claude уже взялся за работу ⚡",
                     reply_to_message_id=reply_to_id)
 
             except Exception as e:
