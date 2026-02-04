@@ -63,7 +63,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.6.0"  # ← added Netlify deploy notifications
+BOT_VERSION = "0.7.0"  # ← fixed notifications, /apps in groups, HTML escaping
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -109,12 +109,21 @@ def parse_labels() -> List[str]:
     return [x.strip() for x in GITHUB_LABELS.split(",") if x.strip()]
 
 
+def html_escape(s: str) -> str:
+    """Escape HTML special characters for Telegram HTML parse_mode."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def extract_ticket_command(text: str) -> Tuple[bool, str]:
     t = (text or "").strip()
     if not t:
         return False, ""
     if t.startswith("/ticket"):
-        rest = t[len("/ticket") :].strip()
+        rest = t[len("/ticket"):].strip()
+        # Strip @botname suffix if present
+        if rest.startswith("@"):
+            parts = rest.split(" ", 1)
+            rest = parts[1].strip() if len(parts) > 1 else ""
         return True, rest
     return False, ""
 
@@ -125,18 +134,28 @@ def tg_send_message(chat_id: int, text: str, reply_to_message_id: Optional[int] 
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = reply_to_message_id
         payload["allow_sending_without_reply"] = True
-    requests.post(f"{TG_API}/sendMessage", json=payload, timeout=30)
+    r = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=30)
+    resp = r.json()
+    if not resp.get("ok"):
+        print(f"[TG ERROR] sendMessage failed: {resp.get('error_code')} {resp.get('description')}")
 
 
 def tg_send_html(chat_id: int, html: str) -> None:
     """Send message with HTML parse_mode (for user mentions etc)."""
     payload: Dict[str, Any] = {"chat_id": chat_id, "text": html, "parse_mode": "HTML"}
-    requests.post(f"{TG_API}/sendMessage", json=payload, timeout=30)
+    r = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=30)
+    resp = r.json()
+    if not resp.get("ok"):
+        print(f"[TG_HTML ERROR] {resp.get('error_code')} {resp.get('description')}")
+        print(f"[TG_HTML ERROR] chat_id={chat_id} text={html[:200]}")
+        # Fallback: try without HTML parse_mode
+        fallback_payload: Dict[str, Any] = {"chat_id": chat_id, "text": html}
+        requests.post(f"{TG_API}/sendMessage", json=fallback_payload, timeout=30)
 
 
 def tg_mention(user_id: int, first_name: str) -> str:
     """Create Telegram HTML mention link."""
-    safe_name = first_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    safe_name = html_escape(first_name)
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
 
@@ -207,7 +226,6 @@ def transcribe(audio_path: str) -> str:
         res = client.audio.transcriptions.create(
             model="gpt-4o-transcribe",
             file=f,
-            # language="ru",
         )
     return (res.text or "").strip()
 
@@ -333,31 +351,29 @@ def format_issue(text: str, chat_id: int, user: dict, dev_info: Optional[Dict[st
 
 
 # ===================== UI / FLOW =====================
-def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None) -> None:
-    """Send inline keyboard with WebApp buttons for dev/test environments."""
-    print(f"[APPS] show_apps_menu called for chat={chat_id}")
-    print(f"[APPS] WEBAPP_URL_DEV_1={WEBAPP_URL_DEV_1!r}")
-    print(f"[APPS] WEBAPP_URL_DEV_2={WEBAPP_URL_DEV_2!r}")
+def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None, in_group: bool = False) -> None:
+    """Send inline keyboard with app buttons. In groups use url buttons, in DM use web_app."""
+    print(f"[APPS] show_apps_menu called for chat={chat_id} in_group={in_group}")
 
     keyboard: List[List[Dict[str, Any]]] = []
 
     if WEBAPP_URL_DEV_1:
-        keyboard.append([{
-            "text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}",
-            "web_app": {"url": WEBAPP_URL_DEV_1},
-        }])
+        if in_group:
+            keyboard.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "url": WEBAPP_URL_DEV_1}])
+        else:
+            keyboard.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "web_app": {"url": WEBAPP_URL_DEV_1}}])
     if WEBAPP_URL_DEV_2:
-        keyboard.append([{
-            "text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}",
-            "web_app": {"url": WEBAPP_URL_DEV_2},
-        }])
+        if in_group:
+            keyboard.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "url": WEBAPP_URL_DEV_2}])
+        else:
+            keyboard.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "web_app": {"url": WEBAPP_URL_DEV_2}}])
 
     if not keyboard:
         print("[APPS] No dev URLs configured — sending error message")
         tg_send_message(chat_id, "Dev URLs не настроены. Задайте WEBAPP_URL_DEV_* в env.", reply_to_message_id=reply_to_message_id)
         return
 
-    print(f"[APPS] Sending keyboard with {len(keyboard)} buttons")
+    print(f"[APPS] Sending keyboard with {len(keyboard)} buttons (group={in_group})")
     resp = tg_send_message_with_keyboard(
         chat_id,
         "Тестовые приложения:",
@@ -412,7 +428,6 @@ def extract_image_from_message(msg: dict) -> Optional[Dict[str, Any]]:
     return None
 
 
-
 # ===================== ROUTES =====================
 @app.get("/")
 def health():
@@ -437,31 +452,38 @@ async def github_notify(req: Request):
     branch = payload.get("branch", "")
     issue_number = payload.get("issue_number", "")
     issue_title = payload.get("issue_title", "")
-    pr_url = payload.get("pr_url", "")
 
     print(f"[GH_NOTIFY] event={event} branch={branch} issue=#{issue_number}")
 
     dev_ctx = DEV_CHAT.get(branch)
     if not dev_ctx:
-        print(f"[GH_NOTIFY] No chat for branch={branch}, skipping")
+        print(f"[GH_NOTIFY] No chat for branch={branch}, DEV_CHAT keys={list(DEV_CHAT.keys())}")
         return {"ok": True, "skipped": "no chat"}
 
     chat_id = dev_ctx["chat_id"]
     mention = tg_mention(dev_ctx["user_id"], dev_ctx["first_name"])
 
+    safe_title = html_escape(issue_title)
+    safe_branch = html_escape(branch)
+
     if event == "claude_started":
-        tg_send_html(chat_id, f"🤖 Claude начал работу\n\n#{issue_number}: {issue_title}\nВетка: {branch}")
+        tg_send_html(chat_id,
+            f"🤖 Claude начал работу\n\n"
+            f"#{issue_number}: {safe_title}\n"
+            f"Ветка: {safe_branch}")
     elif event == "opus_unavailable":
         tg_send_html(chat_id,
             f"⚠️ Opus недоступен, переключаюсь на Sonnet\n\n"
-            f"#{issue_number}: {issue_title}")
+            f"#{issue_number}: {safe_title}")
     elif event == "claude_failed":
         tg_send_html(chat_id,
-            f"❌ Claude упал при работе над задачей (3 попытки)\n\n"
-            f"#{issue_number}: {issue_title}\n\n"
+            f"❌ Claude упал при работе над <b>#{issue_number}</b>: {safe_title}\n"
             f"Попробуй создать тикет ещё раз.")
     elif event == "merged":
-        tg_send_html(chat_id, f"📦 Изменения в ветке {branch}\n\n#{issue_number}: {issue_title}\n\nОжидаем деплой...")
+        tg_send_html(chat_id,
+            f"📦 Изменения в ветке {safe_branch}\n\n"
+            f"#{issue_number}: {safe_title}\n\n"
+            f"Ожидаем деплой...")
     else:
         print(f"[GH_NOTIFY] Unknown event={event}")
         return {"ok": True, "skipped": "unknown event"}
@@ -485,6 +507,7 @@ async def netlify_webhook(req: Request):
     commit_msg = payload.get("title", "")
 
     print(f"[NETLIFY] state={state} branch={branch} site={site_name}")
+    print(f"[NETLIFY] DEV_CHAT keys={list(DEV_CHAT.keys())}")
 
     # Находим контекст разработчика
     dev_ctx = DEV_CHAT.get(branch)
@@ -495,22 +518,29 @@ async def netlify_webhook(req: Request):
     chat_id = dev_ctx["chat_id"]
     mention = tg_mention(dev_ctx["user_id"], dev_ctx["first_name"])
 
+    safe_site = html_escape(site_name)
+    safe_branch = html_escape(branch)
+    safe_commit = html_escape(commit_msg) if commit_msg else ""
+
     if state == "ready":
         text = f"✅ Деплой готов! {mention}, можно тестировать"
-        text += f"\n\nСайт: {site_name}"
-        text += f"\nВетка: {branch}"
-        if commit_msg:
-            text += f"\nКоммит: {commit_msg}"
+        text += f"\n\nСайт: {safe_site}"
+        text += f"\nВетка: {safe_branch}"
+        if safe_commit:
+            text += f"\nКоммит: {safe_commit}"
         text += f"\n\n🔗 {ssl_url}"
         tg_send_html(chat_id, text)
     elif state == "error":
-        text = f"❌ Деплой упал ({branch})"
-        text += f"\n\nСайт: {site_name}"
-        if error_message:
-            text += f"\nОшибка: {error_message}"
-        tg_send_message(chat_id, text)
+        safe_error = html_escape(error_message) if error_message else ""
+        text = f"❌ Деплой упал ({safe_branch})"
+        text += f"\n\nСайт: {safe_site}"
+        if safe_error:
+            text += f"\nОшибка: {safe_error}"
+        tg_send_html(chat_id, text)
     elif state == "building":
-        tg_send_message(chat_id, f"🔨 Деплой начался\nСайт: {site_name} | Ветка: {branch}")
+        tg_send_html(chat_id,
+            f"🔨 Деплой начался\n"
+            f"Сайт: {safe_site} | Ветка: {safe_branch}")
     else:
         print(f"[NETLIFY] Ignoring state={state}")
         return {"ok": True, "skipped": state}
@@ -619,12 +649,14 @@ async def telegram_webhook(req: Request):
                 extra_labels: List[str] = []
                 if dev_info:
                     extra_labels.append(dev_info["label"])
+                    # Запоминаем chat_id ТОЛЬКО при создании тикета
                     DEV_CHAT[dev_info["branch"]] = {
                         "chat_id": chat_id,
                         "user_id": clicker_id,
                         "first_name": from_user.get("first_name", ""),
                     }
                     print(f"[CREATE] Developer: user={clicker_id} → branch={dev_info['branch']} label={dev_info['label']} chat={chat_id}")
+                    print(f"[CREATE] DEV_CHAT updated: {dev_info['branch']} → chat_id={chat_id}")
                 else:
                     print(f"[CREATE] No developer mapping for user={clicker_id}, using default branch")
 
@@ -700,14 +732,7 @@ async def telegram_webhook(req: Request):
 
     text = (msg.get("text") or "").strip()
 
-    # Запоминаем chat_id и имя разработчика при любом взаимодействии
-    dev_info_for_tracking = DEVELOPER_MAP.get(user_id)
-    if dev_info_for_tracking:
-        DEV_CHAT[dev_info_for_tracking["branch"]] = {
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "first_name": user.get("first_name", ""),
-        }
+    # НЕ перезаписываем DEV_CHAT тут — только при создании тикета (action=="create")
 
     # Help
     cmd_base = text.lower().split("@")[0]
@@ -721,7 +746,7 @@ async def telegram_webhook(req: Request):
     # Apps menu
     if cmd_base == "/apps":
         print(f"[CMD] /apps from user={user_id} chat={chat_id} group={in_group}")
-        show_apps_menu(chat_id, reply_to_message_id=message_id)
+        show_apps_menu(chat_id, reply_to_message_id=message_id, in_group=in_group)
         return {"ok": True}
 
     # Debug info
@@ -740,7 +765,7 @@ async def telegram_webhook(req: Request):
             f"WEBAPP_PROD: {'✅' if WEBAPP_URL_PRODUCTION else '❌'}\n"
             f"WEBAPP_DEV1: {'✅' if WEBAPP_URL_DEV_1 else '❌'} {WEBAPP_DEV_1_NAME}\n"
             f"WEBAPP_DEV2: {'✅' if WEBAPP_URL_DEV_2 else '❌'} {WEBAPP_DEV_2_NAME}\n"
-            f"NOTIFY_CHAT: {DEV_CHAT or '(empty, send any command to register)'}\n"
+            f"DEV_CHAT: {DEV_CHAT or '(empty)'}\n"
             f"REQUIRE_TICKET_CMD: {REQUIRE_TICKET_COMMAND}\n"
             f"Group chat: {in_group}\n"
             f"---\n"
