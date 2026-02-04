@@ -669,7 +669,7 @@ async def telegram_webhook(req: Request):
                     f"📋 Тикет создан!\n\n"
                     f"#{issue_number}: {issue_fmt['title']}\n"
                     f"{issue_url}\n\n"
-                    f"Claude уже взялся за работу ⚡",
+                    f"Claude скоро возьмётся за работу...",
                     reply_to_message_id=reply_to_id)
 
             except Exception as e:
