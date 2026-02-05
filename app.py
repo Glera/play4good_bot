@@ -487,21 +487,20 @@ async def github_notify(req: Request):
     if event == "claude_started":
         tg_send_html(chat_id,
             f"🤖 Claude начал работу\n\n"
-            f"#{issue_number} ({mention}): {safe_title}\n"
+            f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}\n"
             f"Ветка: {safe_branch}")
     elif event == "opus_unavailable":
         tg_send_html(chat_id,
             f"⚠️ Opus недоступен, переключаюсь на Sonnet\n\n"
-            f"#{issue_number} ({mention}): {safe_title}")
+            f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}")
     elif event == "claude_failed":
         tg_send_html(chat_id,
-            f"❌ Claude упал при работе над <b>#{issue_number}</b> ({mention}): {safe_title}\n"
+            f"❌ Claude упал при работе над <b>#{issue_number}</b> ({html_escape(dev_ctx['first_name'])}): {safe_title}\n"
             f"Попробуй создать тикет ещё раз.")
     elif event == "merged":
         tg_send_html(chat_id,
-            f"📦 Изменения в ветке {safe_branch}\n\n"
-            f"#{issue_number} ({mention}): {safe_title}\n\n"
-            f"Ожидаем деплой...")
+            f"📦 PR вмержен в {safe_branch}\n\n"
+            f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}")
     else:
         print(f"[GH_NOTIFY] Unknown event={event}")
         return {"ok": True, "skipped": "unknown event"}
@@ -733,7 +732,7 @@ async def telegram_webhook(req: Request):
 
                 tg_send_message(chat_id,
                     f"📋 Тикет создан!\n\n"
-                    f"#{issue_number}: {issue_fmt['title']}\n"
+                    f"#{issue_number} ({from_user.get('first_name', '')}): {issue_fmt['title']}\n"
                     f"{issue_url}\n\n"
                     f"Claude скоро возьмётся за работу...",
                     reply_to_message_id=reply_to_id)
