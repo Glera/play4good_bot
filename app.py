@@ -63,7 +63,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.7.0"  # ← fixed notifications, /apps in groups, HTML escaping
+BOT_VERSION = "0.7.1"  # ← /ticket text in DM fix
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
