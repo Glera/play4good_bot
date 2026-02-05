@@ -358,15 +358,9 @@ def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None, in_g
     keyboard: List[List[Dict[str, Any]]] = []
 
     if WEBAPP_URL_DEV_1:
-        if in_group:
-            keyboard.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "url": WEBAPP_URL_DEV_1}])
-        else:
-            keyboard.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "web_app": {"url": WEBAPP_URL_DEV_1}}])
+        keyboard.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "web_app": {"url": WEBAPP_URL_DEV_1}}])
     if WEBAPP_URL_DEV_2:
-        if in_group:
-            keyboard.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "url": WEBAPP_URL_DEV_2}])
-        else:
-            keyboard.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "web_app": {"url": WEBAPP_URL_DEV_2}}])
+        keyboard.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "web_app": {"url": WEBAPP_URL_DEV_2}}])
 
     if not keyboard:
         print("[APPS] No dev URLs configured — sending error message")
