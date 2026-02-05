@@ -63,7 +63,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.7.1"  # ← /ticket text in DM fix
+BOT_VERSION = "0.7.2"  # ← auto-create dev branch from main if missing
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -259,6 +259,22 @@ def gh_branch_exists(branch: str) -> bool:
     owner, repo = gh_repo_parts()
     r = requests.get(f"{GH_API}/repos/{owner}/{repo}/git/ref/heads/{branch}", headers=gh_headers(), timeout=15)
     return r.status_code == 200
+
+
+def gh_create_branch(branch: str, from_branch: str = "main") -> str:
+    """Create a new branch from an existing branch. Returns the SHA."""
+    owner, repo = gh_repo_parts()
+    source_sha = gh_get_branch_sha(from_branch)
+    r = requests.post(
+        f"{GH_API}/repos/{owner}/{repo}/git/refs",
+        headers=gh_headers(),
+        json={"ref": f"refs/heads/{branch}", "sha": source_sha},
+        timeout=30,
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Create branch failed {r.status_code}: {r.text[:500]}")
+    print(f"[BRANCH] Created {branch} from {from_branch} ({source_sha[:7]})")
+    return source_sha
 
 
 def gh_get_branch_sha(branch: str) -> str:
@@ -649,6 +665,12 @@ async def telegram_webhook(req: Request):
                 extra_labels: List[str] = []
                 if dev_info:
                     extra_labels.append(dev_info["label"])
+                    # Ensure dev branch exists (create from main if deleted after merge)
+                    if not gh_branch_exists(dev_info["branch"]):
+                        try:
+                            gh_create_branch(dev_info["branch"], "main")
+                        except Exception as e:
+                            print(f"[CREATE] Failed to create branch {dev_info['branch']}: {e}")
                     # Запоминаем chat_id ТОЛЬКО при создании тикета
                     DEV_CHAT[dev_info["branch"]] = {
                         "chat_id": chat_id,
