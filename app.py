@@ -352,29 +352,59 @@ def format_issue(text: str, chat_id: int, user: dict, dev_info: Optional[Dict[st
 
 # ===================== UI / FLOW =====================
 def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None, in_group: bool = False) -> None:
-    """Send inline keyboard with app buttons. In groups use url buttons, in DM use web_app."""
+    """Send keyboard with WebApp buttons. In groups use ReplyKeyboard, in DM use InlineKeyboard."""
     print(f"[APPS] show_apps_menu called for chat={chat_id} in_group={in_group}")
 
-    keyboard: List[List[Dict[str, Any]]] = []
-
-    if WEBAPP_URL_DEV_1:
-        keyboard.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "web_app": {"url": WEBAPP_URL_DEV_1}}])
-    if WEBAPP_URL_DEV_2:
-        keyboard.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "web_app": {"url": WEBAPP_URL_DEV_2}}])
-
-    if not keyboard:
+    if not WEBAPP_URL_DEV_1 and not WEBAPP_URL_DEV_2:
         print("[APPS] No dev URLs configured — sending error message")
         tg_send_message(chat_id, "Dev URLs не настроены. Задайте WEBAPP_URL_DEV_* в env.", reply_to_message_id=reply_to_message_id)
         return
 
-    print(f"[APPS] Sending keyboard with {len(keyboard)} buttons (group={in_group})")
-    resp = tg_send_message_with_keyboard(
-        chat_id,
-        "Тестовые приложения:",
-        keyboard,
-        reply_to_message_id=reply_to_message_id,
-    )
-    print(f"[APPS] TG response ok={resp.get('ok') if resp else 'None'}")
+    if in_group:
+        # web_app inline buttons don't work in groups (Telegram limitation)
+        # Use ReplyKeyboardMarkup instead — opens WebView properly
+        keyboard: List[List[Dict[str, Any]]] = []
+        if WEBAPP_URL_DEV_1:
+            keyboard.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "web_app": {"url": WEBAPP_URL_DEV_1}}])
+        if WEBAPP_URL_DEV_2:
+            keyboard.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "web_app": {"url": WEBAPP_URL_DEV_2}}])
+
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": "Тестовые приложения (кнопки внизу 👇):",
+            "reply_markup": {
+                "keyboard": keyboard,
+                "resize_keyboard": True,
+                "one_time_keyboard": True,
+                "selective": True,
+            },
+        }
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+            payload["allow_sending_without_reply"] = True
+
+        print(f"[APPS] Sending ReplyKeyboard with {len(keyboard)} buttons")
+        r = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=30)
+        resp = r.json()
+        if not resp.get("ok"):
+            print(f"[TG ERROR] sendMessage failed: {resp.get('error_code')} {resp.get('description')}")
+        print(f"[APPS] TG response ok={resp.get('ok')}")
+    else:
+        # In DM: use InlineKeyboardMarkup with web_app
+        keyboard_inline: List[List[Dict[str, Any]]] = []
+        if WEBAPP_URL_DEV_1:
+            keyboard_inline.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "web_app": {"url": WEBAPP_URL_DEV_1}}])
+        if WEBAPP_URL_DEV_2:
+            keyboard_inline.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "web_app": {"url": WEBAPP_URL_DEV_2}}])
+
+        print(f"[APPS] Sending InlineKeyboard with {len(keyboard_inline)} buttons")
+        resp = tg_send_message_with_keyboard(
+            chat_id,
+            "Тестовые приложения:",
+            keyboard_inline,
+            reply_to_message_id=reply_to_message_id,
+        )
+        print(f"[APPS] TG response ok={resp.get('ok') if resp else 'None'}")
 
 
 def confirmation_text(state: Dict[str, Any]) -> str:
