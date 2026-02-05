@@ -64,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.7.3"  # ← deploy dedup, auto-create branch
+BOT_VERSION = "0.7.4"  # ← mention author in all notifications
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -383,21 +383,22 @@ def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None, in_g
             "WebApp кнопки работают только в личке. Напиши мне /apps в личные сообщения 👉 @play4good_bot",
             reply_to_message_id=reply_to_message_id)
         return
-        # In DM: use InlineKeyboardMarkup with web_app
-        keyboard_inline: List[List[Dict[str, Any]]] = []
-        if WEBAPP_URL_DEV_1:
-            keyboard_inline.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "web_app": {"url": WEBAPP_URL_DEV_1}}])
-        if WEBAPP_URL_DEV_2:
-            keyboard_inline.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "web_app": {"url": WEBAPP_URL_DEV_2}}])
 
-        print(f"[APPS] Sending InlineKeyboard with {len(keyboard_inline)} buttons")
-        resp = tg_send_message_with_keyboard(
-            chat_id,
-            "Тестовые приложения:",
-            keyboard_inline,
-            reply_to_message_id=reply_to_message_id,
-        )
-        print(f"[APPS] TG response ok={resp.get('ok') if resp else 'None'}")
+    # In DM: use InlineKeyboardMarkup with web_app
+    keyboard_inline: List[List[Dict[str, Any]]] = []
+    if WEBAPP_URL_DEV_1:
+        keyboard_inline.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "web_app": {"url": WEBAPP_URL_DEV_1}}])
+    if WEBAPP_URL_DEV_2:
+        keyboard_inline.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "web_app": {"url": WEBAPP_URL_DEV_2}}])
+
+    print(f"[APPS] Sending InlineKeyboard with {len(keyboard_inline)} buttons")
+    resp = tg_send_message_with_keyboard(
+        chat_id,
+        "Тестовые приложения:",
+        keyboard_inline,
+        reply_to_message_id=reply_to_message_id,
+    )
+    print(f"[APPS] TG response ok={resp.get('ok') if resp else 'None'}")
 
 
 def confirmation_text(state: Dict[str, Any]) -> str:
@@ -486,20 +487,20 @@ async def github_notify(req: Request):
     if event == "claude_started":
         tg_send_html(chat_id,
             f"🤖 Claude начал работу\n\n"
-            f"#{issue_number}: {safe_title}\n"
+            f"#{issue_number} ({mention}): {safe_title}\n"
             f"Ветка: {safe_branch}")
     elif event == "opus_unavailable":
         tg_send_html(chat_id,
             f"⚠️ Opus недоступен, переключаюсь на Sonnet\n\n"
-            f"#{issue_number}: {safe_title}")
+            f"#{issue_number} ({mention}): {safe_title}")
     elif event == "claude_failed":
         tg_send_html(chat_id,
-            f"❌ Claude упал при работе над <b>#{issue_number}</b>: {safe_title}\n"
+            f"❌ Claude упал при работе над <b>#{issue_number}</b> ({mention}): {safe_title}\n"
             f"Попробуй создать тикет ещё раз.")
     elif event == "merged":
         tg_send_html(chat_id,
             f"📦 Изменения в ветке {safe_branch}\n\n"
-            f"#{issue_number}: {safe_title}\n\n"
+            f"#{issue_number} ({mention}): {safe_title}\n\n"
             f"Ожидаем деплой...")
     else:
         print(f"[GH_NOTIFY] Unknown event={event}")
