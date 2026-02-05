@@ -72,6 +72,9 @@ BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os
 # Maps branch → {chat_id, user_id, first_name} (запоминаем откуда и кто создавал тикеты)
 DEV_CHAT: Dict[str, Dict[str, Any]] = {}  # e.g. {"dev/Gleb": {"chat_id": -100123, "user_id": 456, "first_name": "Глеб"}}
 
+# Track recently created branches to distinguish "created from main" deploys
+BRANCH_JUST_CREATED: Dict[str, float] = {}  # branch → timestamp
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -545,10 +548,13 @@ async def netlify_webhook(req: Request):
             print(f"[NETLIFY] Skipping deploy notification for screenshot commit: {commit_msg}")
             return {"ok": True, "skipped": "screenshot commit"}
 
-        # Skip merge commits — pattern: "text (#123)" from GitHub merge/squash
-        if commit_msg and re.search(r"\(#\d+\)$", commit_msg.strip()):
-            print(f"[NETLIFY] Skipping deploy notification for merge commit: {commit_msg}")
-            return {"ok": True, "skipped": "merge commit"}
+        # Check if this is a deploy from branch just created from main
+        created_at = BRANCH_JUST_CREATED.pop(branch, 0)
+        if created_at and (time.time() - created_at) < 120:
+            print(f"[NETLIFY] Branch {branch} just created from main, sending info message")
+            tg_send_html(chat_id,
+                f"🔄 Ветка {safe_branch} создана из main, деплой синхронизирован")
+            return {"ok": True, "notified": True}
 
         text = f"✅ Деплой готов! {mention}, можно тестировать"
         text += f"\n\nСайт: {safe_site}"
@@ -680,6 +686,7 @@ async def telegram_webhook(req: Request):
                     if not gh_branch_exists(dev_info["branch"]):
                         try:
                             gh_create_branch(dev_info["branch"], "main")
+                            BRANCH_JUST_CREATED[dev_info["branch"]] = time.time()
                         except Exception as e:
                             print(f"[CREATE] Failed to create branch {dev_info['branch']}: {e}")
                     # Запоминаем chat_id ТОЛЬКО при создании тикета
