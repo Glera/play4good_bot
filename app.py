@@ -845,6 +845,21 @@ async def telegram_webhook(req: Request):
         if text and not msg.get("voice") and not msg.get("audio"):
             return {"ok": True}
 
+    # /ticket <text> in DM (outside group gating)
+    if text and not in_group:
+        is_cmd, rest = extract_ticket_command(text)
+        if is_cmd and rest:
+            dev_info = DEVELOPER_MAP.get(user_id)
+            PENDING[key] = {
+                "stage": "confirm",
+                "text": rest,
+                "ts": now_ts(),
+                "screenshot": None,
+                "dev_info": dev_info,
+            }
+            show_confirmation(chat_id, user_id, PENDING[key], reply_to_message_id=message_id)
+            return {"ok": True}
+
     # Plain text outside group gating
     if text and not msg.get("voice") and not msg.get("audio"):
         tg_send_message(chat_id, "Пришли голосовое (или /ticket <текст>). Скриншот можно отправить после распознавания.", reply_to_message_id=message_id)
