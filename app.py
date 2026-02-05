@@ -361,35 +361,11 @@ def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None, in_g
         return
 
     if in_group:
-        # web_app inline buttons don't work in groups (Telegram limitation)
-        # Use ReplyKeyboardMarkup instead — opens WebView properly
-        keyboard: List[List[Dict[str, Any]]] = []
-        if WEBAPP_URL_DEV_1:
-            keyboard.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "web_app": {"url": WEBAPP_URL_DEV_1}}])
-        if WEBAPP_URL_DEV_2:
-            keyboard.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "web_app": {"url": WEBAPP_URL_DEV_2}}])
-
-        payload: Dict[str, Any] = {
-            "chat_id": chat_id,
-            "text": "Тестовые приложения (кнопки внизу 👇):",
-            "reply_markup": {
-                "keyboard": keyboard,
-                "resize_keyboard": True,
-                "one_time_keyboard": True,
-                "selective": True,
-            },
-        }
-        if reply_to_message_id is not None:
-            payload["reply_to_message_id"] = reply_to_message_id
-            payload["allow_sending_without_reply"] = True
-
-        print(f"[APPS] Sending ReplyKeyboard with {len(keyboard)} buttons")
-        r = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=30)
-        resp = r.json()
-        if not resp.get("ok"):
-            print(f"[TG ERROR] sendMessage failed: {resp.get('error_code')} {resp.get('description')}")
-        print(f"[APPS] TG response ok={resp.get('ok')}")
-    else:
+        # web_app buttons don't work in groups (Telegram limitation)
+        tg_send_message(chat_id,
+            "WebApp кнопки работают только в личке. Напиши мне /apps в личные сообщения 👉 @play4good_bot",
+            reply_to_message_id=reply_to_message_id)
+        return
         # In DM: use InlineKeyboardMarkup with web_app
         keyboard_inline: List[List[Dict[str, Any]]] = []
         if WEBAPP_URL_DEV_1:
