@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import base64
 import tempfile
@@ -63,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.7.2"  # ← auto-create dev branch from main if missing
+BOT_VERSION = "0.7.3"  # ← deploy dedup, auto-create branch
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -539,6 +540,16 @@ async def netlify_webhook(req: Request):
     safe_commit = html_escape(commit_msg) if commit_msg else ""
 
     if state == "ready":
+        # Skip deploy notifications for screenshot uploads (not real code changes)
+        if commit_msg and "Add screenshot for issue" in commit_msg:
+            print(f"[NETLIFY] Skipping deploy notification for screenshot commit: {commit_msg}")
+            return {"ok": True, "skipped": "screenshot commit"}
+
+        # Skip merge commits — pattern: "text (#123)" from GitHub merge/squash
+        if commit_msg and re.search(r"\(#\d+\)$", commit_msg.strip()):
+            print(f"[NETLIFY] Skipping deploy notification for merge commit: {commit_msg}")
+            return {"ok": True, "skipped": "merge commit"}
+
         text = f"✅ Деплой готов! {mention}, можно тестировать"
         text += f"\n\nСайт: {safe_site}"
         text += f"\nВетка: {safe_branch}"
