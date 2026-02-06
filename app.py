@@ -64,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.7.4"  # ← mention author in all notifications
+BOT_VERSION = "0.7.5"  # ← Claude can send messages during work
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -509,6 +509,46 @@ async def github_notify(req: Request):
         return {"ok": True, "skipped": "unknown event"}
 
     return {"ok": True, "notified": True}
+
+
+@app.post("/claude/message")
+async def claude_message(req: Request):
+    """Receive messages from Claude during work — plans, progress, questions."""
+    try:
+        payload = await req.json()
+    except Exception:
+        return {"ok": False, "error": "invalid json"}
+
+    branch = payload.get("branch", "")
+    issue_number = payload.get("issue_number", "")
+    message_type = payload.get("type", "info")  # plan, progress, question, done, error
+    text = payload.get("text", "")
+
+    print(f"[CLAUDE_MSG] type={message_type} branch={branch} issue=#{issue_number}")
+    print(f"[CLAUDE_MSG] text={text[:200]}")
+
+    dev_ctx = DEV_CHAT.get(branch)
+    if not dev_ctx:
+        print(f"[CLAUDE_MSG] No chat for branch={branch}")
+        return {"ok": True, "skipped": "no chat"}
+
+    chat_id = dev_ctx["chat_id"]
+    safe_text = html_escape(text)
+
+    # Emoji by message type
+    emoji = {
+        "plan": "📋",
+        "progress": "⏳",
+        "question": "❓",
+        "done": "✅",
+        "error": "⚠️",
+        "info": "💬",
+    }.get(message_type, "💬")
+
+    tg_send_html(chat_id,
+        f"{emoji} <b>Claude #{issue_number}</b>\n\n{safe_text}")
+
+    return {"ok": True, "sent": True}
 
 
 @app.post("/netlify/webhook")
