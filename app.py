@@ -64,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.8.0"  # ← Ticket queue with screenshot support
+BOT_VERSION = "0.9.0"  # ← Multi-agent workflow support
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -588,6 +588,13 @@ async def github_notify(req: Request):
             f"🤖 Claude начал работу\n\n"
             f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}\n"
             f"Ветка: {safe_branch}")
+    elif event == "phase":
+        phase_name = payload.get("phase", "")
+        phase_num = payload.get("phase_num", "")
+        safe_phase = html_escape(phase_name)
+        tg_send_html(chat_id,
+            f"🔄 <b>Фаза {phase_num}</b>: {safe_phase}\n"
+            f"#{issue_number}: {safe_title}")
     elif event == "opus_unavailable":
         tg_send_html(chat_id,
             f"⚠️ Opus недоступен, переключаюсь на Sonnet\n\n"
@@ -615,7 +622,7 @@ async def github_notify(req: Request):
 
 @app.post("/claude/message")
 async def claude_message(req: Request):
-    """Receive messages from Claude during work — plans, progress, questions."""
+    """Receive messages from Claude during work — plans, progress, questions, reviews, tests."""
     try:
         payload = await req.json()
     except Exception:
@@ -623,7 +630,7 @@ async def claude_message(req: Request):
 
     branch = payload.get("branch", "")
     issue_number = payload.get("issue_number", "")
-    message_type = payload.get("type", "info")  # plan, progress, question, done, error
+    message_type = payload.get("type", "info")
     text = payload.get("text", "")
 
     print(f"[CLAUDE_MSG] type={message_type} branch={branch} issue=#{issue_number}")
@@ -637,18 +644,38 @@ async def claude_message(req: Request):
     chat_id = dev_ctx["chat_id"]
     safe_text = html_escape(text)
 
-    # Emoji by message type
-    emoji = {
-        "plan": "📋",
-        "progress": "⏳",
-        "question": "❓",
-        "done": "✅",
-        "error": "⚠️",
-        "info": "💬",
-    }.get(message_type, "💬")
+    # Truncate very long messages (Codex reviews, test output)
+    MAX_MSG_LEN = 3500
+    if len(safe_text) > MAX_MSG_LEN:
+        safe_text = safe_text[:MAX_MSG_LEN] + "\n\n<i>… (обрезано)</i>"
 
-    tg_send_html(chat_id,
-        f"{emoji} <b>Claude #{issue_number}</b>\n\n{safe_text}")
+    # Emoji and header by message type
+    TYPE_CONFIG = {
+        "plan":          {"emoji": "📋", "header": "План"},
+        "progress":      {"emoji": "⏳", "header": "Прогресс"},
+        "question":      {"emoji": "❓", "header": "Вопрос"},
+        "done":          {"emoji": "✅", "header": "Готово"},
+        "error":         {"emoji": "⚠️", "header": "Ошибка"},
+        "info":          {"emoji": "💬", "header": ""},
+        # Multi-agent workflow types
+        "codex_review":  {"emoji": "🔍", "header": "Codex Review"},
+        "phase":         {"emoji": "🔄", "header": "Фаза"},
+        "test_pass":     {"emoji": "✅", "header": "Тесты пройдены"},
+        "test_fail":     {"emoji": "❌", "header": "Тесты упали"},
+        "perf_pass":     {"emoji": "⚡", "header": "Перфоманс ОК"},
+        "perf_fail":     {"emoji": "🐌", "header": "Перфоманс регрессия"},
+    }
+
+    config = TYPE_CONFIG.get(message_type, {"emoji": "💬", "header": ""})
+    emoji = config["emoji"]
+    header = config["header"]
+
+    if header:
+        tg_send_html(chat_id,
+            f"{emoji} <b>{header}</b> — #{issue_number}\n\n{safe_text}")
+    else:
+        tg_send_html(chat_id,
+            f"{emoji} <b>Claude #{issue_number}</b>\n\n{safe_text}")
 
     return {"ok": True, "sent": True}
 
