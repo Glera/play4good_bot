@@ -64,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.9.1"  # ← /clear command for stuck queue
+BOT_VERSION = "0.9.2"  # ← skip deploy notify for merge-from-main
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -716,6 +716,12 @@ async def netlify_webhook(req: Request):
         if commit_msg and "Add screenshot for issue" in commit_msg:
             print(f"[NETLIFY] Skipping deploy notification for screenshot commit: {commit_msg}")
             return {"ok": True, "skipped": "screenshot commit"}
+
+        # Skip deploy notifications for merge-from-main commits (CI infra sync, not real changes)
+        if commit_msg and ("Merge remote-tracking branch 'origin/main'" in commit_msg
+                           or "Merge branch 'main'" in commit_msg):
+            print(f"[NETLIFY] Skipping deploy notification for merge-from-main: {commit_msg}")
+            return {"ok": True, "skipped": "merge from main"}
 
         # Check if this is a deploy from branch just created from main
         created_at = BRANCH_JUST_CREATED.pop(branch, 0)
