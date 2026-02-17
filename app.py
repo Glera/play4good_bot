@@ -64,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.9.0"  # ← Multi-agent workflow support
+BOT_VERSION = "0.9.1"  # ← /clear command for stuck queue
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -1003,9 +1003,9 @@ async def telegram_webhook(req: Request):
     cmd_base = text.lower().split("@")[0]
     if cmd_base in ("/start", "/help", "help"):
         if in_group and REQUIRE_TICKET_COMMAND:
-            tg_send_message(chat_id, "В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/apps — открыть приложения\n/queue — статус очереди тикетов\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
+            tg_send_message(chat_id, "В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/apps — открыть приложения\n/queue — статус очереди тикетов\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
         else:
-            tg_send_message(chat_id, "Пришли голосовое (или /ticket <текст>) — я создам GitHub Issue.\n/apps — открыть приложения\n/queue — статус очереди тикетов\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
+            tg_send_message(chat_id, "Пришли голосовое (или /ticket <текст>) — я создам GitHub Issue.\n/apps — открыть приложения\n/queue — статус очереди тикетов\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
         return {"ok": True}
 
     # Apps menu
@@ -1067,6 +1067,41 @@ async def telegram_webhook(req: Request):
             keyboard,
             reply_to_message_id=message_id,
         )
+        return {"ok": True}
+
+    # Clear stuck queue
+    if cmd_base == "/clear":
+        dev_info = DEVELOPER_MAP.get(user_id)
+        if not dev_info:
+            tg_send_message(chat_id, "У тебя нет привязанной dev-ветки.", reply_to_message_id=message_id)
+            return {"ok": True}
+        branch = dev_info["branch"]
+        active = ACTIVE_TICKET.get(branch)
+        pending_count = queue_size(branch)
+
+        if not active and pending_count == 0:
+            tg_send_message(chat_id, f"Очередь {branch} уже пуста, нечего очищать.", reply_to_message_id=message_id)
+            return {"ok": True}
+
+        # Clear active ticket
+        queue_clear_active(branch)
+
+        # Process queued tickets if any
+        if pending_count > 0:
+            next_issue = queue_process_next(branch)
+            if next_issue:
+                tg_send_message(chat_id,
+                    f"🧹 Очередь {branch} очищена (был активен #{active['issue_number'] if active else '?'})\n"
+                    f"▶️ Запущен следующий тикет из очереди",
+                    reply_to_message_id=message_id)
+            else:
+                tg_send_message(chat_id,
+                    f"🧹 Очередь {branch} очищена, но следующий тикет не удалось создать.",
+                    reply_to_message_id=message_id)
+        else:
+            tg_send_message(chat_id,
+                f"🧹 Активный тикет #{active['issue_number'] if active else '?'} снят с {branch}. Очередь пуста.",
+                reply_to_message_id=message_id)
         return {"ok": True}
 
     # Queue status
