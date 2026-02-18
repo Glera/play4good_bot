@@ -64,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.10.0"  # ← ticket options (multi-agent, testing, approve) + CI approval gate
+BOT_VERSION = "0.11.0"  # ← cherry-pick marking, clean /status, silent phase tracking
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -195,12 +195,15 @@ def tg_send_message_with_keyboard(
     text: str,
     keyboard: List[List[Dict[str, str]]],
     reply_to_message_id: Optional[int] = None,
+    parse_mode: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
         "reply_markup": {"inline_keyboard": keyboard},
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = reply_to_message_id
         payload["allow_sending_without_reply"] = True
@@ -395,6 +398,21 @@ def gh_update_issue(number: int, body: str) -> None:
     )
     if r.status_code >= 300:
         raise RuntimeError(f"Update issue failed {r.status_code}: {r.text[:500]}")
+
+
+def gh_add_label(number: int, label: str) -> bool:
+    """Add a label to an issue. Creates the label if it doesn't exist. Returns True on success."""
+    owner, repo = gh_repo_parts()
+    r = requests.post(
+        f"{GH_API}/repos/{owner}/{repo}/issues/{number}/labels",
+        headers=gh_headers(),
+        json={"labels": [label]},
+        timeout=30,
+    )
+    if r.status_code >= 300:
+        print(f"[GH] Add label failed {r.status_code}: {r.text[:200]}")
+        return False
+    return True
 
 
 def format_issue(text: str, chat_id: int, user: dict, dev_info: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -687,10 +705,15 @@ async def github_notify(req: Request):
         deploy_url = LAST_DEPLOY_URL.pop(branch, "")
         deploy_line = f"\n\n🔗 <a href=\"{deploy_url}\">Открыть билд</a>" if deploy_url else ""
 
-        tg_send_html(chat_id,
+        text = (
             f"📦 Задача завершена — {safe_branch}\n\n"
             f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}"
             f"{deploy_line}")
+
+        # Send with "cherry-pick to main" button
+        keyboard = [[{"text": "⭐ Забрать в main", "callback_data": f"pick:{issue_number}"}]]
+        tg_send_message_with_keyboard(chat_id, text, keyboard, parse_mode="HTML")
+
         # Clear active and process queue
         queue_clear_active(branch)
         queue_process_next(branch)
@@ -961,6 +984,27 @@ async def telegram_webhook(req: Request):
             pass
 
         if not chat_id or not clicker_id:
+            return {"ok": True}
+
+        # --- Cherry-pick marking (not tied to PENDING) ---
+        if data.startswith("pick:"):
+            pick_issue = data.split(":", 1)[1]
+            try:
+                issue_num = int(pick_issue)
+                ok = gh_add_label(issue_num, "cherry-pick")
+                if ok:
+                    # Edit the message: replace button with ⭐ marker
+                    tg_edit_message_with_keyboard(
+                        chat_id, reply_to_id,
+                        msg_obj.get("text", "") + "\n\n⭐ Помечен для переноса в main",
+                        [],  # remove keyboard
+                    )
+                    print(f"[PICK] Issue #{issue_num} marked for cherry-pick by user={clicker_id}")
+                else:
+                    tg_send_message(chat_id, f"Не удалось пометить #{pick_issue}", reply_to_message_id=reply_to_id)
+            except Exception as e:
+                print(f"[PICK] Error: {e}")
+                tg_send_message(chat_id, f"Ошибка: {e}", reply_to_message_id=reply_to_id)
             return {"ok": True}
 
         # --- CI Approval callbacks (not tied to PENDING author) ---
