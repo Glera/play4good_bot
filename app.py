@@ -88,6 +88,10 @@ ACTIVE_TICKET: Dict[str, Optional[Dict[str, Any]]] = {}  # {"issue_number": int,
 # Last Netlify deploy URL per branch (saved when CI is active, included in final notification)
 LAST_DEPLOY_URL: Dict[str, str] = {}  # branch → ssl_url
 
+# Recently merged branches — catch Netlify deploy that arrives after CI finishes
+# branch → {"chat_id": int, "message_id": int, "text": str, "ts": float}
+RECENTLY_MERGED: Dict[str, Dict[str, Any]] = {}
+
 # CI progress tracking per branch (for /status command)
 # {"started_at": int, "last_phase": str, "last_message": str, "last_update_at": int}
 CI_PROGRESS: Dict[str, Dict[str, Any]] = {}
@@ -228,6 +232,7 @@ def tg_edit_message_with_keyboard(
     message_id: int,
     text: str,
     keyboard: List[List[Dict[str, str]]],
+    parse_mode: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Edit existing message text and inline keyboard."""
     payload: Dict[str, Any] = {
@@ -236,6 +241,8 @@ def tg_edit_message_with_keyboard(
         "text": text,
         "reply_markup": {"inline_keyboard": keyboard},
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     r = requests.post(f"{TG_API}/editMessageText", json=payload, timeout=30)
     resp = r.json()
     if not resp.get("ok"):
@@ -835,7 +842,16 @@ async def github_notify(req: Request):
 
         # Send with "cherry-pick to main" button
         keyboard = [[{"text": "⭐ Забрать в main", "callback_data": f"pick:{issue_number}"}]]
-        tg_send_message_with_keyboard(chat_id, text, keyboard, parse_mode="HTML")
+        resp = tg_send_message_with_keyboard(chat_id, text, keyboard, parse_mode="HTML")
+
+        # If no deploy URL yet, save message for Netlify to edit later
+        if not deploy_url and resp and resp.get("ok"):
+            msg_id = resp["result"]["message_id"]
+            RECENTLY_MERGED[branch] = {
+                "chat_id": chat_id, "message_id": msg_id,
+                "text": text, "issue_number": issue_number,
+                "ts": time.time(),
+            }
 
         # Clear active and process queue
         queue_clear_active(branch)
@@ -1102,6 +1118,18 @@ async def netlify_webhook(req: Request):
             LAST_DEPLOY_URL[branch] = ssl_url
             print(f"[NETLIFY] CI active on {branch} — saved deploy URL, suppressing notification")
             return {"ok": True, "skipped": "ci_active", "deploy_url_saved": True}
+
+        # If task just finished (merged), edit the "📦 Задача завершена" message to add deploy link
+        merged_info = RECENTLY_MERGED.pop(branch, None)
+        if merged_info and (time.time() - merged_info["ts"]) < 180:
+            updated_text = merged_info["text"] + f"\n\n🔗 <a href=\"{ssl_url}\">Открыть билд</a>"
+            keyboard = [[{"text": "⭐ Забрать в main", "callback_data": f"pick:{merged_info['issue_number']}"}]]
+            tg_edit_message_with_keyboard(
+                merged_info["chat_id"], merged_info["message_id"],
+                updated_text, keyboard, parse_mode="HTML",
+            )
+            print(f"[NETLIFY] Edited merged message for {branch} with deploy URL")
+            return {"ok": True, "edited_merged": True}
 
         text = f"✅ Деплой готов! {mention}, можно тестировать"
         text += f"\n\nСайт: {safe_site}"
