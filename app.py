@@ -64,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.11.0"  # ← cherry-pick marking, clean /status, silent phase tracking
+BOT_VERSION = "0.12.0"  # ← plan revision flow, enhanced /status steps, done→progress remap
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -89,8 +89,13 @@ LAST_DEPLOY_URL: Dict[str, str] = {}  # branch → ssl_url
 # {"started_at": int, "last_phase": str, "last_message": str, "last_update_at": int}
 CI_PROGRESS: Dict[str, Dict[str, Any]] = {}
 
-# CI plan approval requests: "{branch}:{issue_number}" → "pending" | "approved" | "rejected"
-APPROVAL_REQUESTS: Dict[str, str] = {}
+# CI plan approval requests: "{branch}:{issue_number}" → status dict
+# Status dict: {"status": "pending"|"approved"|"rejected"|"revision", "feedback": str|None}
+APPROVAL_REQUESTS: Dict[str, Any] = {}
+
+# Track which chat is awaiting feedback text for plan revision
+# chat_id → {"approval_key": str, "issue_number": str}
+APPROVAL_AWAITING_FEEDBACK: Dict[int, Dict[str, str]] = {}
 
 # Default ticket options
 DEFAULT_OPTIONS = {"multi_agent": False, "testing": False, "approve_plan": False}
@@ -400,6 +405,96 @@ def gh_update_issue(number: int, body: str) -> None:
         raise RuntimeError(f"Update issue failed {r.status_code}: {r.text[:500]}")
 
 
+def gh_get_file(branch: str, path: str) -> Optional[Dict[str, str]]:
+    """Get file content and SHA from GitHub. Returns {"content": str, "sha": str} or None."""
+    owner, repo = gh_repo_parts()
+    r = requests.get(
+        f"{GH_API}/repos/{owner}/{repo}/contents/{path}",
+        headers=gh_headers(),
+        params={"ref": branch},
+        timeout=30,
+    )
+    if r.status_code == 404:
+        return None
+    if r.status_code >= 300:
+        print(f"[GH] Get file failed {r.status_code}: {r.text[:200]}")
+        return None
+    data = r.json()
+    content = base64.b64decode(data["content"]).decode("utf-8")
+    return {"content": content, "sha": data["sha"]}
+
+
+def gh_update_file(branch: str, path: str, content: str, sha: str, message: str) -> bool:
+    """Update existing file on GitHub. Requires current SHA."""
+    owner, repo = gh_repo_parts()
+    b64 = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+    r = requests.put(
+        f"{GH_API}/repos/{owner}/{repo}/contents/{path}",
+        headers=gh_headers(),
+        json={"message": message, "content": b64, "branch": branch, "sha": sha},
+        timeout=30,
+    )
+    if r.status_code >= 300:
+        print(f"[GH] Update file failed {r.status_code}: {r.text[:200]}")
+        return False
+    return True
+
+
+def gh_mark_devlog_cherry_pick(branch: str, issue_number: int) -> bool:
+    """Mark an issue's entry in DEVLOG.md as cherry-pick candidate."""
+    file_data = gh_get_file(branch, "DEVLOG.md")
+    if not file_data:
+        print(f"[GH] DEVLOG.md not found on {branch}")
+        return False
+
+    content = file_data["content"]
+    sha = file_data["sha"]
+
+    # Find the entry for this issue and update status
+    old_marker = f"## #{issue_number} —"
+    if old_marker not in content:
+        print(f"[GH] Issue #{issue_number} not found in DEVLOG.md")
+        return False
+
+    # Replace status line within this issue's section
+    new_content = content.replace(
+        f"**Статус:** ✅ готово к переносу",
+        f"**Статус:** ⭐ забрать в main",
+        1,  # Only first occurrence after the issue header — but we need to be smarter
+    )
+
+    # More targeted: replace only within the correct issue section
+    # Split by issue headers and find the right section
+    sections = re.split(r'(## #\d+ —)', content)
+    updated = False
+    result_parts = []
+    for i, part in enumerate(sections):
+        if part.strip() == f"## #{issue_number} —" or part.startswith(f"## #{issue_number} — "):
+            # This is the header, next part is the body
+            result_parts.append(part)
+            if i + 1 < len(sections):
+                body = sections[i + 1]
+                body = body.replace(
+                    "**Статус:** ✅ готово к переносу",
+                    "**Статус:** ⭐ забрать в main",
+                    1,
+                )
+                result_parts.append(body)
+                updated = True
+                # Skip the next iteration since we already processed it
+                sections[i + 1] = ""
+        else:
+            result_parts.append(part)
+
+    if not updated:
+        print(f"[GH] Could not find status line for #{issue_number} in DEVLOG.md")
+        return False
+
+    new_content = "".join(result_parts)
+    return gh_update_file(branch, "DEVLOG.md", new_content, sha,
+                          f"Mark #{issue_number} for cherry-pick to main")
+
+
 def gh_add_label(number: int, label: str) -> bool:
     """Add a label to an issue. Creates the label if it doesn't exist. Returns True on success."""
     owner, repo = gh_repo_parts()
@@ -567,6 +662,10 @@ def queue_set_active(branch: str, issue_number: int, title: str) -> None:
         "last_phase": "Запуск",
         "last_message": "",
         "last_update_at": now_ts(),
+        # Phase tracking for /status step-by-step display
+        "options": {},  # {multi_agent, testing, approve} — set by claude_started
+        "phases_done": [],  # list of phase_num strings already completed
+        "current_phase_num": "",  # e.g. "3"
     }
 
 
@@ -668,6 +767,12 @@ async def github_notify(req: Request):
     if event == "claude_started":
         # Mark as active (helps recover queue state after bot restart)
         queue_set_active(branch, int(issue_number), issue_title)
+
+        # Store CI options for /status step display
+        options = payload.get("options", {})
+        if branch in CI_PROGRESS and options:
+            CI_PROGRESS[branch]["options"] = options
+
         tg_send_html(chat_id,
             f"🤖 Claude начал работу\n\n"
             f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}\n"
@@ -679,6 +784,14 @@ async def github_notify(req: Request):
 
         # Always update CI progress (for /status)
         if branch in CI_PROGRESS:
+            # Mark previous phase as done when new phase starts
+            prev = CI_PROGRESS[branch].get("current_phase_num", "")
+            if prev and prev != phase_num:
+                done_list = CI_PROGRESS[branch].get("phases_done", [])
+                if prev not in done_list:
+                    done_list.append(prev)
+                CI_PROGRESS[branch]["phases_done"] = done_list
+            CI_PROGRESS[branch]["current_phase_num"] = phase_num
             CI_PROGRESS[branch]["last_phase"] = phase_name
             CI_PROGRESS[branch]["last_update_at"] = now_ts()
 
@@ -792,7 +905,13 @@ async def claude_message(req: Request):
         "perf_fail":     {"emoji": "🐌", "header": "Перфоманс регрессия"},
     }
 
-    config = TYPE_CONFIG.get(message_type, {"emoji": "💬", "header": ""})
+    # Remap "done" from Claude → "progress" — real completion is /github/notify "merged" event.
+    # Claude sends "done" after Phase 3 (implementation), but code review & tests still follow.
+    display_type = message_type
+    if display_type == "done":
+        display_type = "progress"
+
+    config = TYPE_CONFIG.get(display_type, {"emoji": "💬", "header": ""})
     emoji = config["emoji"]
     header = config["header"]
 
@@ -820,14 +939,26 @@ async def ci_request_approval(req: Request):
     plan_summary = payload.get("plan_summary", "")
 
     approval_key = f"{branch}:{issue_number}"
-    APPROVAL_REQUESTS[approval_key] = "pending"
+    APPROVAL_REQUESTS[approval_key] = {"status": "pending", "feedback": None}
 
     print(f"[APPROVAL] Requested: {approval_key}")
+
+    # Track approval gate as phase "A" for /status
+    if branch in CI_PROGRESS:
+        prev = CI_PROGRESS[branch].get("current_phase_num", "")
+        if prev and prev != "A":
+            done_list = CI_PROGRESS[branch].get("phases_done", [])
+            if prev not in done_list:
+                done_list.append(prev)
+            CI_PROGRESS[branch]["phases_done"] = done_list
+        CI_PROGRESS[branch]["current_phase_num"] = "A"
+        CI_PROGRESS[branch]["last_phase"] = "Ожидание апрува"
+        CI_PROGRESS[branch]["last_update_at"] = now_ts()
 
     dev_ctx = DEV_CHAT.get(branch)
     if not dev_ctx:
         print(f"[APPROVAL] No chat for branch={branch} — auto-approving")
-        APPROVAL_REQUESTS[approval_key] = "approved"
+        APPROVAL_REQUESTS[approval_key] = {"status": "approved", "feedback": None}
         return {"ok": True, "auto_approved": True}
 
     chat_id = dev_ctx["chat_id"]
@@ -836,6 +967,7 @@ async def ci_request_approval(req: Request):
     keyboard = [
         [
             {"text": "✅ Одобрить", "callback_data": f"ci_ok:{issue_number}"},
+            {"text": "✏️ Поправки", "callback_data": f"ci_edit:{issue_number}"},
             {"text": "❌ Отклонить", "callback_data": f"ci_no:{issue_number}"},
         ],
     ]
@@ -858,10 +990,25 @@ async def ci_check_approval(req: Request):
     issue_number = req.query_params.get("issue_number", "")
 
     approval_key = f"{branch}:{issue_number}"
-    status = APPROVAL_REQUESTS.get(approval_key, "not_found")
+    entry = APPROVAL_REQUESTS.get(approval_key)
+
+    if not entry:
+        print(f"[APPROVAL] Check: {approval_key} → not_found")
+        return {"ok": True, "status": "not_found"}
+
+    # Support both old string format and new dict format
+    if isinstance(entry, str):
+        status = entry
+        feedback = None
+    else:
+        status = entry.get("status", "not_found")
+        feedback = entry.get("feedback")
 
     print(f"[APPROVAL] Check: {approval_key} → {status}")
-    return {"ok": True, "status": status}
+    result: Dict[str, Any] = {"ok": True, "status": status}
+    if feedback:
+        result["feedback"] = feedback
+    return result
 
 
 @app.post("/netlify/webhook")
@@ -993,6 +1140,15 @@ async def telegram_webhook(req: Request):
                 issue_num = int(pick_issue)
                 ok = gh_add_label(issue_num, "cherry-pick")
                 if ok:
+                    # Also update DEVLOG.md on the dev branch
+                    dev_info = DEVELOPER_MAP.get(clicker_id)
+                    if dev_info:
+                        devlog_ok = gh_mark_devlog_cherry_pick(dev_info["branch"], issue_num)
+                        if devlog_ok:
+                            print(f"[PICK] DEVLOG.md updated for #{issue_num} on {dev_info['branch']}")
+                        else:
+                            print(f"[PICK] DEVLOG.md update failed for #{issue_num}")
+
                     # Edit the message: replace button with ⭐ marker
                     tg_edit_message_with_keyboard(
                         chat_id, reply_to_id,
@@ -1008,24 +1164,40 @@ async def telegram_webhook(req: Request):
             return {"ok": True}
 
         # --- CI Approval callbacks (not tied to PENDING author) ---
-        if data.startswith("ci_ok:") or data.startswith("ci_no:"):
+        if data.startswith("ci_ok:") or data.startswith("ci_no:") or data.startswith("ci_edit:"):
             ci_issue = data.split(":", 1)[1]
-            approved = data.startswith("ci_ok:")
 
             # Find approval key for this issue across all branches
             target_key = None
-            for key_candidate, status in APPROVAL_REQUESTS.items():
-                if key_candidate.endswith(f":{ci_issue}") and status == "pending":
+            for key_candidate, entry in APPROVAL_REQUESTS.items():
+                entry_status = entry.get("status") if isinstance(entry, dict) else entry
+                if key_candidate.endswith(f":{ci_issue}") and entry_status == "pending":
                     target_key = key_candidate
                     break
 
-            if target_key:
-                APPROVAL_REQUESTS[target_key] = "approved" if approved else "rejected"
-                status_text = "✅ План одобрен" if approved else "❌ План отклонён"
-                tg_send_message(chat_id, f"{status_text} — #{ci_issue}", reply_to_message_id=reply_to_id)
-                print(f"[APPROVAL] {target_key} → {'approved' if approved else 'rejected'} by user={clicker_id}")
-            else:
+            if not target_key:
                 tg_send_message(chat_id, f"Запрос на апрув #{ci_issue} не найден или уже обработан.", reply_to_message_id=reply_to_id)
+                return {"ok": True}
+
+            if data.startswith("ci_ok:"):
+                APPROVAL_REQUESTS[target_key] = {"status": "approved", "feedback": None}
+                tg_send_message(chat_id, f"✅ План одобрен — #{ci_issue}", reply_to_message_id=reply_to_id)
+                print(f"[APPROVAL] {target_key} → approved by user={clicker_id}")
+            elif data.startswith("ci_edit:"):
+                # Ask user to type their corrections
+                APPROVAL_AWAITING_FEEDBACK[chat_id] = {
+                    "approval_key": target_key,
+                    "issue_number": ci_issue,
+                }
+                tg_send_message(chat_id,
+                    f"✏️ Напиши поправки к плану #{ci_issue}.\n"
+                    f"Следующее текстовое сообщение будет отправлено Claude как фидбек.",
+                    reply_to_message_id=reply_to_id)
+                print(f"[APPROVAL] {target_key} → awaiting feedback from user={clicker_id}")
+            else:  # ci_no
+                APPROVAL_REQUESTS[target_key] = {"status": "rejected", "feedback": None}
+                tg_send_message(chat_id, f"❌ План отклонён — #{ci_issue}", reply_to_message_id=reply_to_id)
+                print(f"[APPROVAL] {target_key} → rejected by user={clicker_id}")
             return {"ok": True}
 
         parts = data.split(":")
@@ -1424,11 +1596,43 @@ async def telegram_webhook(req: Request):
                 mins = elapsed // 60
                 secs = elapsed % 60
                 lines.append(f"⏱ Время: {mins}м {secs}с")
-                lines.append(f"📍 Этап: {progress['last_phase']}")
+
+                # Build workflow steps display
+                opts = progress.get("options", {})
+                multi = opts.get("multi_agent") == "true"
+                testing = opts.get("testing") == "true"
+                approve = opts.get("approve") == "true"
+
+                # Define all possible workflow steps
+                all_steps = [
+                    ("1", "Планирование", True),
+                    ("2", "Codex ревью", multi),
+                    ("A", "Апрув плана", approve),
+                    ("3", "Реализация", True),
+                    ("4", "Код ревью", multi),
+                    ("5", "Тестирование", testing),
+                    ("6", "Финализация", True),
+                ]
+                # Filter to only applicable steps
+                steps = [(num, name) for num, name, enabled in all_steps if enabled]
+                phases_done = progress.get("phases_done", [])
+                current_num = progress.get("current_phase_num", "")
+
+                if steps and (phases_done or current_num):
+                    lines.append("")
+                    for num, name in steps:
+                        if num in phases_done:
+                            lines.append(f"  ✅ {name}")
+                        elif num == current_num:
+                            lines.append(f"  ▶️ {name}")
+                        else:
+                            lines.append(f"  ⬜ {name}")
+                else:
+                    lines.append(f"📍 Этап: {progress['last_phase']}")
 
                 since_update = now_ts() - progress["last_update_at"]
                 if since_update > 300:
-                    lines.append(f"⚠️ Последнее обновление: {since_update // 60}м назад")
+                    lines.append(f"\n⚠️ Последнее обновление: {since_update // 60}м назад")
 
                 if progress["last_message"]:
                     msg_preview = progress["last_message"][:120]
@@ -1449,6 +1653,19 @@ async def telegram_webhook(req: Request):
             lines.append(f"\n🔗 Последний билд: {deploy_url}")
 
         tg_send_message(chat_id, "\n".join(lines), reply_to_message_id=message_id)
+        return {"ok": True}
+
+    # Approval feedback: user is typing plan corrections
+    if chat_id in APPROVAL_AWAITING_FEEDBACK and text and not text.startswith("/"):
+        fb = APPROVAL_AWAITING_FEEDBACK.pop(chat_id)
+        approval_key = fb["approval_key"]
+        ci_issue = fb["issue_number"]
+        APPROVAL_REQUESTS[approval_key] = {"status": "revision", "feedback": text}
+        tg_send_message(chat_id,
+            f"✏️ Поправки отправлены Claude — #{ci_issue}\n\n"
+            f"Claude перепланирует с учётом твоих замечаний.",
+            reply_to_message_id=message_id)
+        print(f"[APPROVAL] {approval_key} → revision with feedback: {text[:100]}")
         return {"ok": True}
 
     # If pending exists: allow edit and screenshot
