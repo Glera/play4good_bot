@@ -64,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.9.4"  # ← suppress Netlify deploy during CI + fix phase notifications
+BOT_VERSION = "0.9.5"  # ← /status command + CI progress tracking
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -84,6 +84,10 @@ ACTIVE_TICKET: Dict[str, Optional[Dict[str, Any]]] = {}  # {"issue_number": int,
 
 # Last Netlify deploy URL per branch (saved when CI is active, included in final notification)
 LAST_DEPLOY_URL: Dict[str, str] = {}  # branch → ssl_url
+
+# CI progress tracking per branch (for /status command)
+# {"started_at": int, "last_phase": str, "last_message": str, "last_update_at": int}
+CI_PROGRESS: Dict[str, Dict[str, Any]] = {}
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -488,11 +492,18 @@ def queue_is_busy(branch: str) -> bool:
 def queue_set_active(branch: str, issue_number: int, title: str) -> None:
     """Mark ticket as active."""
     ACTIVE_TICKET[branch] = {"issue_number": issue_number, "title": title}
+    CI_PROGRESS[branch] = {
+        "started_at": now_ts(),
+        "last_phase": "Запуск",
+        "last_message": "",
+        "last_update_at": now_ts(),
+    }
 
 
 def queue_clear_active(branch: str) -> None:
     """Clear active ticket."""
     ACTIVE_TICKET[branch] = None
+    CI_PROGRESS.pop(branch, None)
 
 
 def queue_process_next(branch: str) -> Optional[Dict[str, Any]]:
@@ -644,6 +655,19 @@ async def claude_message(req: Request):
 
     print(f"[CLAUDE_MSG] type={message_type} branch={branch} issue=#{issue_number}")
     print(f"[CLAUDE_MSG] text={text[:200]}")
+
+    # Track CI progress for /status command
+    if branch and branch in CI_PROGRESS:
+        config_lookup = {
+            "plan": "План", "progress": "Реализация", "codex_review": "Codex Review",
+            "test_pass": "Тесты OK", "test_fail": "Тесты упали",
+            "perf_pass": "Перфоманс OK", "perf_fail": "Перфоманс регрессия",
+            "done": "Завершено", "error": "Ошибка",
+        }
+        phase_label = config_lookup.get(message_type, message_type)
+        CI_PROGRESS[branch]["last_phase"] = phase_label
+        CI_PROGRESS[branch]["last_message"] = text[:150]
+        CI_PROGRESS[branch]["last_update_at"] = now_ts()
 
     dev_ctx = DEV_CHAT.get(branch)
     if not dev_ctx:
@@ -1030,9 +1054,9 @@ async def telegram_webhook(req: Request):
     cmd_base = text.lower().split("@")[0]
     if cmd_base in ("/start", "/help", "help"):
         if in_group and REQUIRE_TICKET_COMMAND:
-            tg_send_message(chat_id, "В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/apps — открыть приложения\n/queue — статус очереди тикетов\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
+            tg_send_message(chat_id, "В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/status — статус текущего тикета\n/queue — очередь тикетов\n/apps — открыть приложения\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
         else:
-            tg_send_message(chat_id, "Пришли голосовое (или /ticket <текст>) — я создам GitHub Issue.\n/apps — открыть приложения\n/queue — статус очереди тикетов\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
+            tg_send_message(chat_id, "Пришли голосовое (или /ticket <текст>) — я создам GitHub Issue.\n/status — статус текущего тикета\n/queue — очередь тикетов\n/apps — открыть приложения\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
         return {"ok": True}
 
     # Apps menu
@@ -1158,6 +1182,53 @@ async def telegram_webhook(req: Request):
         else:
             lines.append("\n⏳ Очередь пуста")
         
+        tg_send_message(chat_id, "\n".join(lines), reply_to_message_id=message_id)
+        return {"ok": True}
+
+    # Status command — full CI status overview
+    if cmd_base == "/status":
+        dev_info = DEVELOPER_MAP.get(user_id)
+        if not dev_info:
+            tg_send_message(chat_id, "У тебя нет привязанной dev-ветки.", reply_to_message_id=message_id)
+            return {"ok": True}
+        branch = dev_info["branch"]
+        active = ACTIVE_TICKET.get(branch)
+        progress = CI_PROGRESS.get(branch)
+        pending = TICKET_QUEUE.get(branch, [])
+        deploy_url = LAST_DEPLOY_URL.get(branch)
+
+        lines: List[str] = [f"📊 Статус — {branch}\n"]
+
+        if active:
+            lines.append(f"▶️ Тикет: #{active['issue_number']} — {active['title'][:60]}")
+
+            if progress:
+                elapsed = now_ts() - progress["started_at"]
+                mins = elapsed // 60
+                secs = elapsed % 60
+                lines.append(f"⏱ Время: {mins}м {secs}с")
+                lines.append(f"📍 Этап: {progress['last_phase']}")
+
+                since_update = now_ts() - progress["last_update_at"]
+                if since_update > 300:
+                    lines.append(f"⚠️ Последнее обновление: {since_update // 60}м назад")
+
+                if progress["last_message"]:
+                    msg_preview = progress["last_message"][:120]
+                    lines.append(f"\n💬 {msg_preview}")
+        else:
+            lines.append("💤 Нет активных тикетов")
+
+        if pending:
+            lines.append(f"\n📋 В очереди: {len(pending)}")
+            for i, t in enumerate(pending[:3], 1):
+                lines.append(f"  {i}. {t['title'][:40]}")
+            if len(pending) > 3:
+                lines.append(f"  ... и ещё {len(pending) - 3}")
+
+        if deploy_url:
+            lines.append(f"\n🔗 Последний билд: {deploy_url}")
+
         tg_send_message(chat_id, "\n".join(lines), reply_to_message_id=message_id)
         return {"ok": True}
 
