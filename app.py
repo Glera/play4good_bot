@@ -63,8 +63,11 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
+# Reverse lookup: branch → user_id (for DEV_CHAT fallback after bot restart)
+_BRANCH_TO_DEV: Dict[str, int] = {info["branch"]: uid for uid, info in DEVELOPER_MAP.items()}
+
 # Debug / versioning
-BOT_VERSION = "0.12.0"  # ← plan revision flow, enhanced /status steps, done→progress remap
+BOT_VERSION = "0.12.1"  # ← DEV_CHAT fallback from DEVELOPER_MAP after bot restart
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -755,8 +758,15 @@ async def github_notify(req: Request):
 
     dev_ctx = DEV_CHAT.get(branch)
     if not dev_ctx:
-        print(f"[GH_NOTIFY] No chat for branch={branch}, DEV_CHAT keys={list(DEV_CHAT.keys())}")
-        return {"ok": True, "skipped": "no chat"}
+        # Fallback: recover from DEVELOPER_MAP after bot restart
+        fallback_uid = _BRANCH_TO_DEV.get(branch)
+        if fallback_uid:
+            dev_ctx = {"chat_id": fallback_uid, "user_id": fallback_uid, "first_name": "Dev"}
+            DEV_CHAT[branch] = dev_ctx
+            print(f"[GH_NOTIFY] Recovered DEV_CHAT for {branch} from DEVELOPER_MAP (uid={fallback_uid})")
+        else:
+            print(f"[GH_NOTIFY] No chat for branch={branch}, DEV_CHAT keys={list(DEV_CHAT.keys())}")
+            return {"ok": True, "skipped": "no chat"}
 
     chat_id = dev_ctx["chat_id"]
     mention = tg_mention(dev_ctx["user_id"], dev_ctx["first_name"])
@@ -877,8 +887,14 @@ async def claude_message(req: Request):
 
     dev_ctx = DEV_CHAT.get(branch)
     if not dev_ctx:
-        print(f"[CLAUDE_MSG] No chat for branch={branch}")
-        return {"ok": True, "skipped": "no chat"}
+        fallback_uid = _BRANCH_TO_DEV.get(branch)
+        if fallback_uid:
+            dev_ctx = {"chat_id": fallback_uid, "user_id": fallback_uid, "first_name": "Dev"}
+            DEV_CHAT[branch] = dev_ctx
+            print(f"[CLAUDE_MSG] Recovered DEV_CHAT for {branch} from DEVELOPER_MAP (uid={fallback_uid})")
+        else:
+            print(f"[CLAUDE_MSG] No chat for branch={branch}")
+            return {"ok": True, "skipped": "no chat"}
 
     chat_id = dev_ctx["chat_id"]
     safe_text = html_escape(text)
@@ -957,9 +973,15 @@ async def ci_request_approval(req: Request):
 
     dev_ctx = DEV_CHAT.get(branch)
     if not dev_ctx:
-        print(f"[APPROVAL] No chat for branch={branch} — auto-approving")
-        APPROVAL_REQUESTS[approval_key] = {"status": "approved", "feedback": None}
-        return {"ok": True, "auto_approved": True}
+        fallback_uid = _BRANCH_TO_DEV.get(branch)
+        if fallback_uid:
+            dev_ctx = {"chat_id": fallback_uid, "user_id": fallback_uid, "first_name": "Dev"}
+            DEV_CHAT[branch] = dev_ctx
+            print(f"[APPROVAL] Recovered DEV_CHAT for {branch} from DEVELOPER_MAP (uid={fallback_uid})")
+        else:
+            print(f"[APPROVAL] No chat for branch={branch} — auto-approving")
+            APPROVAL_REQUESTS[approval_key] = {"status": "approved", "feedback": None}
+            return {"ok": True, "auto_approved": True}
 
     chat_id = dev_ctx["chat_id"]
     safe_plan = html_escape(plan_summary)[:2000] if plan_summary else "<i>план не передан</i>"
@@ -1032,8 +1054,14 @@ async def netlify_webhook(req: Request):
     # Находим контекст разработчика
     dev_ctx = DEV_CHAT.get(branch)
     if not dev_ctx:
-        print(f"[NETLIFY] No chat for branch={branch}, skipping")
-        return {"ok": True, "skipped": "no chat mapped"}
+        fallback_uid = _BRANCH_TO_DEV.get(branch)
+        if fallback_uid:
+            dev_ctx = {"chat_id": fallback_uid, "user_id": fallback_uid, "first_name": "Dev"}
+            DEV_CHAT[branch] = dev_ctx
+            print(f"[NETLIFY] Recovered DEV_CHAT for {branch} from DEVELOPER_MAP (uid={fallback_uid})")
+        else:
+            print(f"[NETLIFY] No chat for branch={branch}, skipping")
+            return {"ok": True, "skipped": "no chat mapped"}
 
     chat_id = dev_ctx["chat_id"]
     mention = tg_mention(dev_ctx["user_id"], dev_ctx["first_name"])
