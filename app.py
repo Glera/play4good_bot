@@ -1055,8 +1055,9 @@ async def netlify_webhook(req: Request):
             return {"ok": True, "skipped": "merge from main"}
 
         # Skip deploy notifications for DEVLOG updates (CI meta-commit, not real changes)
-        if commit_msg and commit_msg.startswith("docs: update DEVLOG"):
-            print(f"[NETLIFY] Skipping deploy notification for DEVLOG update: {commit_msg}")
+        if commit_msg and (commit_msg.startswith("docs: update DEVLOG")
+                           or "for cherry-pick to main" in commit_msg):
+            print(f"[NETLIFY] Skipping deploy notification for DEVLOG/cherry-pick update: {commit_msg}")
             return {"ok": True, "skipped": "devlog update"}
 
         # Check if this is a deploy from branch just created from main
