@@ -64,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.9.2"  # ← skip deploy notify for merge-from-main
+BOT_VERSION = "0.9.3"  # ← skip DEVLOG + merge-from-main deploy notifications
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -722,6 +722,11 @@ async def netlify_webhook(req: Request):
                            or "Merge branch 'main'" in commit_msg):
             print(f"[NETLIFY] Skipping deploy notification for merge-from-main: {commit_msg}")
             return {"ok": True, "skipped": "merge from main"}
+
+        # Skip deploy notifications for DEVLOG updates (CI meta-commit, not real changes)
+        if commit_msg and commit_msg.startswith("docs: update DEVLOG"):
+            print(f"[NETLIFY] Skipping deploy notification for DEVLOG update: {commit_msg}")
+            return {"ok": True, "skipped": "devlog update"}
 
         # Check if this is a deploy from branch just created from main
         created_at = BRANCH_JUST_CREATED.pop(branch, 0)
