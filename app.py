@@ -657,10 +657,19 @@ async def github_notify(req: Request):
     elif event == "phase":
         phase_name = payload.get("phase", "")
         phase_num = payload.get("phase_num", "")
-        safe_phase = html_escape(phase_name)
-        tg_send_html(chat_id,
-            f"🔄 <b>Фаза {phase_num}</b>: {safe_phase}\n"
-            f"#{issue_number}: {safe_title}")
+        silent = payload.get("silent", False)
+
+        # Always update CI progress (for /status)
+        if branch in CI_PROGRESS:
+            CI_PROGRESS[branch]["last_phase"] = phase_name
+            CI_PROGRESS[branch]["last_update_at"] = now_ts()
+
+        # Send TG notification unless silent (tracking-only)
+        if not silent:
+            safe_phase = html_escape(phase_name)
+            tg_send_html(chat_id,
+                f"🔄 <b>Фаза {phase_num}</b>: {safe_phase}\n"
+                f"#{issue_number}: {safe_title}")
     elif event == "opus_unavailable":
         tg_send_html(chat_id,
             f"⚠️ Opus недоступен, переключаюсь на Sonnet\n\n"
@@ -710,15 +719,24 @@ async def claude_message(req: Request):
 
     # Track CI progress for /status command
     if branch and branch in CI_PROGRESS:
-        config_lookup = {
-            "plan": "План", "progress": "Реализация", "codex_review": "Codex Review",
+        # Update phase label only for definitive events (phases tracked via /github/notify)
+        phase_update_types = {
             "test_pass": "Тесты OK", "test_fail": "Тесты упали",
             "perf_pass": "Перфоманс OK", "perf_fail": "Перфоманс регрессия",
             "done": "Завершено", "error": "Ошибка",
         }
-        phase_label = config_lookup.get(message_type, message_type)
-        CI_PROGRESS[branch]["last_phase"] = phase_label
-        CI_PROGRESS[branch]["last_message"] = text[:150]
+        if message_type in phase_update_types:
+            CI_PROGRESS[branch]["last_phase"] = phase_update_types[message_type]
+
+        # Clean up message for /status display
+        clean_msg = text.replace('\\n', ' ').replace('\n', ' ').strip()
+        # Strip "Phase N — " prefix (phase tracked separately)
+        clean_msg = re.sub(r'^Phase \d+[a-z]?\s*[—–\-]\s*', '', clean_msg)
+        # Skip raw JSON (useless in status)
+        stripped = clean_msg.lstrip()
+        if stripped.startswith('[') or stripped.startswith('{'):
+            clean_msg = ""
+        CI_PROGRESS[branch]["last_message"] = clean_msg[:150]
         CI_PROGRESS[branch]["last_update_at"] = now_ts()
 
     dev_ctx = DEV_CHAT.get(branch)
@@ -1376,10 +1394,12 @@ async def telegram_webhook(req: Request):
 
         if pending:
             lines.append(f"\n📋 В очереди: {len(pending)}")
-            for i, t in enumerate(pending[:3], 1):
-                lines.append(f"  {i}. {t['title'][:40]}")
-            if len(pending) > 3:
-                lines.append(f"  ... и ещё {len(pending) - 3}")
+            for i, t in enumerate(pending[:5], 1):
+                lines.append(f"  {i}. {t['title'][:50]}")
+            if len(pending) > 5:
+                lines.append(f"  ... и ещё {len(pending) - 5}")
+        else:
+            lines.append("\n📋 Очередь пуста")
 
         if deploy_url:
             lines.append(f"\n🔗 Последний билд: {deploy_url}")
@@ -1503,6 +1523,7 @@ async def telegram_webhook(req: Request):
             "ts": now_ts(),
             "screenshot": None,
             "dev_info": dev_info,
+            "options": dict(DEFAULT_OPTIONS),
         }
         show_confirmation(chat_id, user_id, PENDING[key], reply_to_message_id=message_id)
         return {"ok": True}
