@@ -64,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.9.3"  # ← skip DEVLOG + merge-from-main deploy notifications
+BOT_VERSION = "0.9.4"  # ← suppress Netlify deploy during CI + fix phase notifications
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -81,6 +81,9 @@ TICKET_QUEUE: Dict[str, List[Dict[str, Any]]] = {}
 
 # Currently executing ticket: branch → issue info (None if idle)
 ACTIVE_TICKET: Dict[str, Optional[Dict[str, Any]]] = {}  # {"issue_number": int, "title": str}
+
+# Last Netlify deploy URL per branch (saved when CI is active, included in final notification)
+LAST_DEPLOY_URL: Dict[str, str] = {}  # branch → ssl_url
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -600,6 +603,7 @@ async def github_notify(req: Request):
             f"⚠️ Opus недоступен, переключаюсь на Sonnet\n\n"
             f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}")
     elif event == "claude_failed":
+        LAST_DEPLOY_URL.pop(branch, None)  # Clear stale deploy URL
         tg_send_html(chat_id,
             f"❌ Claude упал при работе над <b>#{issue_number}</b> ({html_escape(dev_ctx['first_name'])}): {safe_title}\n"
             f"Попробуй создать тикет ещё раз.")
@@ -607,9 +611,14 @@ async def github_notify(req: Request):
         queue_clear_active(branch)
         queue_process_next(branch)
     elif event == "merged":
+        # Include saved deploy URL if available
+        deploy_url = LAST_DEPLOY_URL.pop(branch, "")
+        deploy_line = f"\n\n🔗 <a href=\"{deploy_url}\">Открыть билд</a>" if deploy_url else ""
+
         tg_send_html(chat_id,
-            f"📦 PR вмержен в {safe_branch}\n\n"
-            f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}")
+            f"📦 Задача завершена — {safe_branch}\n\n"
+            f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}"
+            f"{deploy_line}")
         # Clear active and process queue
         queue_clear_active(branch)
         queue_process_next(branch)
@@ -735,6 +744,13 @@ async def netlify_webhook(req: Request):
             tg_send_html(chat_id,
                 f"🔄 Ветка {safe_branch} создана из main, деплой синхронизирован")
             return {"ok": True, "notified": True}
+
+        # If CI is actively working on this branch — save URL, don't notify yet
+        # The deploy URL will be included in the final "done" notification
+        if queue_is_busy(branch):
+            LAST_DEPLOY_URL[branch] = ssl_url
+            print(f"[NETLIFY] CI active on {branch} — saved deploy URL, suppressing notification")
+            return {"ok": True, "skipped": "ci_active", "deploy_url_saved": True}
 
         text = f"✅ Деплой готов! {mention}, можно тестировать"
         text += f"\n\nСайт: {safe_site}"
@@ -1094,8 +1110,9 @@ async def telegram_webhook(req: Request):
             tg_send_message(chat_id, f"Очередь {branch} уже пуста, нечего очищать.", reply_to_message_id=message_id)
             return {"ok": True}
 
-        # Clear active ticket
+        # Clear active ticket and stale deploy URL
         queue_clear_active(branch)
+        LAST_DEPLOY_URL.pop(branch, None)
 
         # Process queued tickets if any
         if pending_count > 0:
