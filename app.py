@@ -64,7 +64,7 @@ def _parse_developer_map(raw: str) -> Dict[int, Dict[str, str]]:
 DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 
 # Debug / versioning
-BOT_VERSION = "0.9.5"  # ← /status command + CI progress tracking
+BOT_VERSION = "0.10.0"  # ← ticket options (multi-agent, testing, approve) + CI approval gate
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -88,6 +88,19 @@ LAST_DEPLOY_URL: Dict[str, str] = {}  # branch → ssl_url
 # CI progress tracking per branch (for /status command)
 # {"started_at": int, "last_phase": str, "last_message": str, "last_update_at": int}
 CI_PROGRESS: Dict[str, Dict[str, Any]] = {}
+
+# CI plan approval requests: "{branch}:{issue_number}" → "pending" | "approved" | "rejected"
+APPROVAL_REQUESTS: Dict[str, str] = {}
+
+# Default ticket options
+DEFAULT_OPTIONS = {"multi_agent": False, "testing": False, "approve_plan": False}
+
+# Labels for ticket options
+OPTION_LABELS = {
+    "multi_agent": "ci:multi-agent",
+    "testing": "ci:testing",
+    "approve_plan": "ci:approve",
+}
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -196,6 +209,26 @@ def tg_send_message_with_keyboard(
     if not resp.get("ok"):
         print(f"[TG ERROR] sendMessage failed: {resp.get('error_code')} {resp.get('description')}")
         print(f"[TG ERROR] payload keys: {list(payload.keys())}, keyboard_rows: {len(keyboard)}")
+    return resp
+
+
+def tg_edit_message_with_keyboard(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    keyboard: List[List[Dict[str, str]]],
+) -> Optional[Dict[str, Any]]:
+    """Edit existing message text and inline keyboard."""
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "reply_markup": {"inline_keyboard": keyboard},
+    }
+    r = requests.post(f"{TG_API}/editMessageText", json=payload, timeout=30)
+    resp = r.json()
+    if not resp.get("ok"):
+        print(f"[TG EDIT ERROR] {resp.get('error_code')} {resp.get('description')}")
     return resp
 
 
@@ -421,6 +454,7 @@ def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None, in_g
 def confirmation_text(state: Dict[str, Any]) -> str:
     screenshot = state.get("screenshot")
     dev_info = state.get("dev_info")
+    opts = state.get("options", DEFAULT_OPTIONS)
 
     meta = []
     meta.append(f"Скриншот: {'✅ есть' if screenshot else '— нет'}")
@@ -429,23 +463,41 @@ def confirmation_text(state: Dict[str, Any]) -> str:
     else:
         meta.append("Ветка: default (разработчик не привязан)")
 
+    # Option toggles display
+    opt_parts = []
+    opt_parts.append(f"{'✅' if opts.get('multi_agent') else '—'} мультиагент")
+    opt_parts.append(f"{'✅' if opts.get('testing') else '—'} тесты")
+    opt_parts.append(f"{'✅' if opts.get('approve_plan') else '—'} апрув плана")
+
     return (
         "Вот что я распознал:\n\n"
         + f"\u201c{state['text']}\u201d\n\n"
         + " | ".join(meta)
-        + "\n\n"
-        + "Что делаем?"
+        + f"\nCI: {' | '.join(opt_parts)}"
+        + "\n\nЧто делаем?"
     )
 
 
-def show_confirmation(chat_id: int, author_id: int, state: Dict[str, Any], reply_to_message_id: Optional[int] = None) -> None:
-    keyboard = [
+def confirmation_keyboard(author_id: int, state: Dict[str, Any]) -> List[List[Dict[str, str]]]:
+    opts = state.get("options", DEFAULT_OPTIONS)
+    return [
         [{"text": "✅ Создать issue", "callback_data": f"create:{author_id}"}],
-        [{"text": "✏️ Правка текста", "callback_data": f"edit:{author_id}"}],
-        [{"text": "📎 Скриншот", "callback_data": f"shot:{author_id}"}],
+        [
+            {"text": f"{'🤖' if opts.get('multi_agent') else '⬜'} Мультиагент", "callback_data": f"opt_ma:{author_id}"},
+            {"text": f"{'🧪' if opts.get('testing') else '⬜'} Тесты", "callback_data": f"opt_test:{author_id}"},
+            {"text": f"{'📋' if opts.get('approve_plan') else '⬜'} Апрув", "callback_data": f"opt_appr:{author_id}"},
+        ],
+        [{"text": "✏️ Правка текста", "callback_data": f"edit:{author_id}"}, {"text": "📎 Скриншот", "callback_data": f"shot:{author_id}"}],
         [{"text": "❌ Отмена", "callback_data": f"cancel:{author_id}"}],
     ]
-    tg_send_message_with_keyboard(chat_id, confirmation_text(state), keyboard, reply_to_message_id=reply_to_message_id)
+
+
+def show_confirmation(chat_id: int, author_id: int, state: Dict[str, Any], reply_to_message_id: Optional[int] = None) -> None:
+    keyboard = confirmation_keyboard(author_id, state)
+    resp = tg_send_message_with_keyboard(chat_id, confirmation_text(state), keyboard, reply_to_message_id=reply_to_message_id)
+    # Store message_id for later editing (toggle buttons)
+    if resp and resp.get("ok"):
+        state["confirmation_message_id"] = resp["result"]["message_id"]
 
 
 def extract_image_from_message(msg: dict) -> Optional[Dict[str, Any]]:
@@ -713,6 +765,64 @@ async def claude_message(req: Request):
     return {"ok": True, "sent": True}
 
 
+# ===================== CI APPROVAL GATE =====================
+@app.post("/ci/request-approval")
+async def ci_request_approval(req: Request):
+    """Called by workflow after Phase 1+2 to request developer approval of the plan."""
+    try:
+        payload = await req.json()
+    except Exception:
+        return {"ok": False, "error": "invalid json"}
+
+    branch = payload.get("branch", "")
+    issue_number = payload.get("issue_number", "")
+    plan_summary = payload.get("plan_summary", "")
+
+    approval_key = f"{branch}:{issue_number}"
+    APPROVAL_REQUESTS[approval_key] = "pending"
+
+    print(f"[APPROVAL] Requested: {approval_key}")
+
+    dev_ctx = DEV_CHAT.get(branch)
+    if not dev_ctx:
+        print(f"[APPROVAL] No chat for branch={branch} — auto-approving")
+        APPROVAL_REQUESTS[approval_key] = "approved"
+        return {"ok": True, "auto_approved": True}
+
+    chat_id = dev_ctx["chat_id"]
+    safe_plan = html_escape(plan_summary)[:2000] if plan_summary else "<i>план не передан</i>"
+
+    keyboard = [
+        [
+            {"text": "✅ Одобрить", "callback_data": f"ci_ok:{issue_number}"},
+            {"text": "❌ Отклонить", "callback_data": f"ci_no:{issue_number}"},
+        ],
+    ]
+
+    tg_send_message_with_keyboard(
+        chat_id,
+        f"📋 Апрув плана — #{issue_number}\n\n"
+        f"{safe_plan}\n\n"
+        f"Claude ждёт одобрения. Одобрить план?",
+        keyboard,
+    )
+
+    return {"ok": True, "approval_key": approval_key}
+
+
+@app.get("/ci/check-approval")
+async def ci_check_approval(req: Request):
+    """Polled by workflow to check if approval was granted."""
+    branch = req.query_params.get("branch", "")
+    issue_number = req.query_params.get("issue_number", "")
+
+    approval_key = f"{branch}:{issue_number}"
+    status = APPROVAL_REQUESTS.get(approval_key, "not_found")
+
+    print(f"[APPROVAL] Check: {approval_key} → {status}")
+    return {"ok": True, "status": status}
+
+
 @app.post("/netlify/webhook")
 async def netlify_webhook(req: Request):
     """Receive Netlify deploy notification and notify developer in Telegram."""
@@ -835,6 +945,27 @@ async def telegram_webhook(req: Request):
         if not chat_id or not clicker_id:
             return {"ok": True}
 
+        # --- CI Approval callbacks (not tied to PENDING author) ---
+        if data.startswith("ci_ok:") or data.startswith("ci_no:"):
+            ci_issue = data.split(":", 1)[1]
+            approved = data.startswith("ci_ok:")
+
+            # Find approval key for this issue across all branches
+            target_key = None
+            for key_candidate, status in APPROVAL_REQUESTS.items():
+                if key_candidate.endswith(f":{ci_issue}") and status == "pending":
+                    target_key = key_candidate
+                    break
+
+            if target_key:
+                APPROVAL_REQUESTS[target_key] = "approved" if approved else "rejected"
+                status_text = "✅ План одобрен" if approved else "❌ План отклонён"
+                tg_send_message(chat_id, f"{status_text} — #{ci_issue}", reply_to_message_id=reply_to_id)
+                print(f"[APPROVAL] {target_key} → {'approved' if approved else 'rejected'} by user={clicker_id}")
+            else:
+                tg_send_message(chat_id, f"Запрос на апрув #{ci_issue} не найден или уже обработан.", reply_to_message_id=reply_to_id)
+            return {"ok": True}
+
         parts = data.split(":")
         action = parts[0] if parts else ""
         if len(parts) < 2:
@@ -881,6 +1012,24 @@ async def telegram_webhook(req: Request):
         if action == "noop":
             return {"ok": True}
 
+        # Toggle ticket options (re-render confirmation in-place)
+        if action in ("opt_ma", "opt_test", "opt_appr"):
+            opts = state.get("options", dict(DEFAULT_OPTIONS))
+            toggle_map = {"opt_ma": "multi_agent", "opt_test": "testing", "opt_appr": "approve_plan"}
+            opt_key = toggle_map[action]
+            opts[opt_key] = not opts.get(opt_key, False)
+            state["options"] = opts
+
+            # Edit existing message with updated text and keyboard
+            conf_msg_id = state.get("confirmation_message_id")
+            if conf_msg_id:
+                tg_edit_message_with_keyboard(
+                    chat_id, conf_msg_id,
+                    confirmation_text(state),
+                    confirmation_keyboard(author_id, state),
+                )
+            return {"ok": True}
+
         if action == "cancel":
             PENDING.pop(key, None)
             tg_send_message(chat_id, "Отменил.", reply_to_message_id=reply_to_id)
@@ -901,7 +1050,13 @@ async def telegram_webhook(req: Request):
                 dev_info = DEVELOPER_MAP.get(clicker_id)
                 extra_labels: List[str] = []
                 branch = None
-                
+
+                # Add CI option labels
+                opts = state.get("options", DEFAULT_OPTIONS)
+                for opt_key, label_name in OPTION_LABELS.items():
+                    if opts.get(opt_key):
+                        extra_labels.append(label_name)
+
                 if dev_info:
                     branch = dev_info["branch"]
                     extra_labels.append(dev_info["label"])
@@ -1263,6 +1418,7 @@ async def telegram_webhook(req: Request):
                 "ts": now_ts(),
                 "screenshot": None,
                 "dev_info": dev_info,
+                "options": dict(DEFAULT_OPTIONS),
             }
             show_confirmation(chat_id, user_id, PENDING[key], reply_to_message_id=message_id)
             return {"ok": True}
@@ -1291,6 +1447,7 @@ async def telegram_webhook(req: Request):
                 "ts": now_ts(),
                 "screenshot": None,
                 "dev_info": dev_info,
+                "options": dict(DEFAULT_OPTIONS),
             }
             show_confirmation(chat_id, user_id, PENDING[key], reply_to_message_id=message_id)
             return {"ok": True}
