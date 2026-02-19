@@ -223,7 +223,7 @@ def _repo_short(repo: str) -> str:
 
 
 # Debug / versioning
-BOT_VERSION = "0.19.1"  # ← show version hint in deploy link
+BOT_VERSION = "0.19.2"  # ← fix merge filter for master branch
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -1401,7 +1401,9 @@ async def netlify_webhook(req: Request):
 
         # Skip deploy notifications for merge-from-main commits (CI infra sync, not real changes)
         if commit_msg and ("Merge remote-tracking branch 'origin/main'" in commit_msg
-                           or "Merge branch 'main'" in commit_msg):
+                           or "Merge remote-tracking branch 'origin/master'" in commit_msg
+                           or "Merge branch 'main'" in commit_msg
+                           or "Merge branch 'master'" in commit_msg):
             print(f"[NETLIFY] Skipping deploy notification for merge-from-main: {commit_msg}")
             return {"ok": True, "skipped": "merge from main"}
 
