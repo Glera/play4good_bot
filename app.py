@@ -15,8 +15,14 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")  # "owner/repo"
+GITHUB_REPO = os.environ.get("GITHUB_REPO")  # "owner/repo" (fallback for single-repo mode)
 GITHUB_LABELS = os.environ.get("GITHUB_LABELS", "")
+
+# Multi-repo config
+# GITHUB_REPOS="owner/repo1:short1:default_branch1,owner/repo2:short2:default_branch2"
+# CHAT_REPO_MAP="-100xxxx:owner/repo1,-100yyyy:owner/repo2"
+_GITHUB_REPOS_RAW = os.environ.get("GITHUB_REPOS", "")
+_CHAT_REPO_MAP_RAW = os.environ.get("CHAT_REPO_MAP", "")
 
 # In groups: require /ticket to avoid noise (recommended)
 REQUIRE_TICKET_COMMAND = os.environ.get("REQUIRE_TICKET_COMMAND", "true").lower() in ("1", "true", "yes", "y")
@@ -66,8 +72,86 @@ DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 # Reverse lookup: branch → user_id (for DEV_CHAT fallback after bot restart)
 _BRANCH_TO_DEV: Dict[str, int] = {info["branch"]: uid for uid, info in DEVELOPER_MAP.items()}
 
+# ===================== MULTI-REPO CONFIG =====================
+def _parse_repos(raw: str) -> Dict[str, Dict[str, str]]:
+    """Parse GITHUB_REPOS env: 'owner/repo:short:branch,...' → {full_name: {short, default_branch}}"""
+    result: Dict[str, Dict[str, str]] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        if len(parts) < 3:
+            print(f"[WARN] Invalid GITHUB_REPOS entry: {entry!r} (expected owner/repo:short:branch)")
+            continue
+        full_name = parts[0]
+        result[full_name] = {"short": parts[1], "default_branch": parts[2]}
+    return result
+
+
+def _parse_chat_repo_map(raw: str) -> Dict[int, str]:
+    """Parse CHAT_REPO_MAP env: '-100xxxx:owner/repo,...' → {chat_id: full_name}"""
+    result: Dict[int, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":", 1)
+        if len(parts) < 2:
+            continue
+        try:
+            result[int(parts[0])] = parts[1]
+        except ValueError:
+            print(f"[WARN] Invalid chat_id in CHAT_REPO_MAP: {parts[0]!r}")
+    return result
+
+
+REPO_CONFIG: Dict[str, Dict[str, str]] = _parse_repos(_GITHUB_REPOS_RAW)
+CHAT_TO_REPO: Dict[int, str] = _parse_chat_repo_map(_CHAT_REPO_MAP_RAW)
+SHORT_TO_REPO: Dict[str, str] = {cfg["short"]: name for name, cfg in REPO_CONFIG.items()}
+
+# If no multi-repo config, register single GITHUB_REPO as fallback
+if not REPO_CONFIG and GITHUB_REPO:
+    REPO_CONFIG[GITHUB_REPO] = {"short": GITHUB_REPO.split("/")[-1], "default_branch": "main"}
+    SHORT_TO_REPO[GITHUB_REPO.split("/")[-1]] = GITHUB_REPO
+
+# Runtime: user → active repo (set by /repo command in personal chats)
+USER_ACTIVE_REPO: Dict[int, str] = {}
+
+
+def resolve_repo(chat_id: int, user_id: int) -> Optional[str]:
+    """Determine target repo from chat context."""
+    # 1. Group → by chat_id
+    if chat_id in CHAT_TO_REPO:
+        return CHAT_TO_REPO[chat_id]
+    # 2. Personal → user's active repo
+    if user_id in USER_ACTIVE_REPO:
+        return USER_ACTIVE_REPO[user_id]
+    # 3. Fallback
+    return GITHUB_REPO
+
+
+def _ctx_key(repo: str, branch: str) -> str:
+    """Composite key for per-repo-per-branch state dicts."""
+    return f"{repo}:{branch}"
+
+
+def _default_branch(repo: Optional[str] = None) -> str:
+    """Get default branch for repo from config, fallback to 'main'."""
+    r = repo or GITHUB_REPO
+    if r and r in REPO_CONFIG:
+        return REPO_CONFIG[r]["default_branch"]
+    return "main"
+
+
+def _repo_short(repo: str) -> str:
+    """Get short name for repo (for display)."""
+    cfg = REPO_CONFIG.get(repo)
+    return cfg["short"] if cfg else repo.split("/")[-1]
+
+
 # Debug / versioning
-BOT_VERSION = "0.16.0"  # ← persistent queue via GitHub Issues
+BOT_VERSION = "0.17.0"  # ← multi-repo support
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -124,6 +208,9 @@ app = FastAPI()
 
 print(f"[BOT] version={BOT_VERSION} build={BUILD_ID} started_at={BOT_STARTED_AT}")
 print(f"[BOT] GITHUB_REPO={GITHUB_REPO} REQUIRE_TICKET_CMD={REQUIRE_TICKET_COMMAND}")
+print(f"[BOT] REPO_CONFIG={REPO_CONFIG}")
+print(f"[BOT] CHAT_TO_REPO={CHAT_TO_REPO}")
+print(f"[BOT] SHORT_TO_REPO={SHORT_TO_REPO}")
 print(f"[BOT] WEBAPP_PROD={WEBAPP_URL_PRODUCTION or '(empty)'}")
 print(f"[BOT] WEBAPP_DEV1={WEBAPP_URL_DEV_1 or '(empty)'} ({WEBAPP_DEV_1_NAME})")
 print(f"[BOT] WEBAPP_DEV2={WEBAPP_URL_DEV_2 or '(empty)'} ({WEBAPP_DEV_2_NAME})")
@@ -310,57 +397,62 @@ def gh_headers() -> Dict[str, str]:
     }
 
 
-def gh_repo_parts() -> Tuple[str, str]:
-    if not GITHUB_REPO or "/" not in GITHUB_REPO:
-        raise RuntimeError("Missing or invalid GITHUB_REPO (expected owner/repo)")
-    owner, repo = GITHUB_REPO.split("/", 1)
-    return owner, repo
+def gh_repo_parts(repo: Optional[str] = None) -> Tuple[str, str]:
+    r = repo or GITHUB_REPO
+    if not r or "/" not in r:
+        raise RuntimeError(f"Missing or invalid repo: {r!r} (expected owner/repo)")
+    owner, name = r.split("/", 1)
+    return owner, name
 
 
-def gh_get_default_branch() -> str:
-    owner, repo = gh_repo_parts()
-    r = requests.get(f"{GH_API}/repos/{owner}/{repo}", headers=gh_headers(), timeout=30)
+def gh_get_default_branch(repo: Optional[str] = None) -> str:
+    owner, name = gh_repo_parts(repo)
+    r = requests.get(f"{GH_API}/repos/{owner}/{name}", headers=gh_headers(), timeout=30)
     r.raise_for_status()
     return r.json()["default_branch"]
 
 
-def gh_branch_exists(branch: str) -> bool:
-    owner, repo = gh_repo_parts()
-    r = requests.get(f"{GH_API}/repos/{owner}/{repo}/git/ref/heads/{branch}", headers=gh_headers(), timeout=15)
+def gh_branch_exists(branch: str, repo: Optional[str] = None) -> bool:
+    owner, name = gh_repo_parts(repo)
+    r = requests.get(f"{GH_API}/repos/{owner}/{name}/git/ref/heads/{branch}", headers=gh_headers(), timeout=15)
     return r.status_code == 200
 
 
-def gh_create_branch(branch: str, from_branch: str = "main") -> str:
+def gh_create_branch(branch: str, from_branch: Optional[str] = None, repo: Optional[str] = None) -> str:
     """Create a new branch from an existing branch. Returns the SHA."""
-    owner, repo = gh_repo_parts()
-    source_sha = gh_get_branch_sha(from_branch)
+    owner, name = gh_repo_parts(repo)
+    if from_branch is None:
+        from_branch = _default_branch(repo)
+    source_sha = gh_get_branch_sha(from_branch, repo=repo)
     r = requests.post(
-        f"{GH_API}/repos/{owner}/{repo}/git/refs",
+        f"{GH_API}/repos/{owner}/{name}/git/refs",
         headers=gh_headers(),
         json={"ref": f"refs/heads/{branch}", "sha": source_sha},
         timeout=30,
     )
     if r.status_code >= 300:
         raise RuntimeError(f"Create branch failed {r.status_code}: {r.text[:500]}")
-    print(f"[BRANCH] Created {branch} from {from_branch} ({source_sha[:7]})")
+    print(f"[BRANCH] Created {branch} from {from_branch} ({source_sha[:7]}) in {repo or GITHUB_REPO}")
     return source_sha
 
 
-def gh_get_branch_sha(branch: str) -> str:
+def gh_get_branch_sha(branch: str, repo: Optional[str] = None) -> str:
     """Get the latest commit SHA of a branch."""
-    owner, repo = gh_repo_parts()
-    r = requests.get(f"{GH_API}/repos/{owner}/{repo}/git/ref/heads/{branch}", headers=gh_headers(), timeout=15)
+    owner, name = gh_repo_parts(repo)
+    r = requests.get(f"{GH_API}/repos/{owner}/{name}/git/ref/heads/{branch}", headers=gh_headers(), timeout=15)
     r.raise_for_status()
     return r.json()["object"]["sha"]
 
 
-def gh_force_reset_branch(branch: str, to_branch: str = "main") -> str:
+def gh_force_reset_branch(branch: str, to_branch: Optional[str] = None, repo: Optional[str] = None) -> str:
     """Force-update branch to point at the same commit as to_branch.
     Returns the SHA it was reset to."""
-    owner, repo = gh_repo_parts()
-    target_sha = gh_get_branch_sha(to_branch)
+    owner, name = gh_repo_parts(repo)
+    if to_branch is None:
+        to_branch = _default_branch(repo)
+    target_sha = gh_get_branch_sha(to_branch, repo=repo)
     r = requests.patch(
-        f"{GH_API}/repos/{owner}/{repo}/git/refs/heads/{branch}",
+        f"{GH_API}/repos/{owner}/{name}/git/refs/heads/{branch}",
         headers=gh_headers(),
         json={"sha": target_sha, "force": True},
         timeout=30,
@@ -370,12 +462,12 @@ def gh_force_reset_branch(branch: str, to_branch: str = "main") -> str:
     return target_sha
 
 
-def gh_create_tag(tag_name: str, sha: str) -> str:
+def gh_create_tag(tag_name: str, sha: str, repo: Optional[str] = None) -> str:
     """Create a lightweight tag pointing at the given SHA.
     Returns the tag name. Silently succeeds if tag already exists."""
-    owner, repo = gh_repo_parts()
+    owner, name = gh_repo_parts(repo)
     r = requests.post(
-        f"{GH_API}/repos/{owner}/{repo}/git/refs",
+        f"{GH_API}/repos/{owner}/{name}/git/refs",
         headers=gh_headers(),
         json={"ref": f"refs/tags/{tag_name}", "sha": sha},
         timeout=30,
@@ -390,13 +482,13 @@ def gh_create_tag(tag_name: str, sha: str) -> str:
     return tag_name
 
 
-def gh_put_file(branch: str, path: str, content_bytes: bytes, message: str) -> str:
-    owner, repo = gh_repo_parts()
+def gh_put_file(branch: str, path: str, content_bytes: bytes, message: str, repo: Optional[str] = None) -> str:
+    owner, name = gh_repo_parts(repo)
     b64 = base64.b64encode(content_bytes).decode("utf-8")
     payload: Dict[str, Any] = {"message": message, "content": b64, "branch": branch}
 
     r = requests.put(
-        f"{GH_API}/repos/{owner}/{repo}/contents/{path}",
+        f"{GH_API}/repos/{owner}/{name}/contents/{path}",
         headers=gh_headers(),
         json=payload,
         timeout=60,
@@ -408,8 +500,8 @@ def gh_put_file(branch: str, path: str, content_bytes: bytes, message: str) -> s
     return data["content"]["html_url"]
 
 
-def gh_create_issue(title: str, body: str, extra_labels: Optional[List[str]] = None) -> Dict[str, Any]:
-    owner, repo = gh_repo_parts()
+def gh_create_issue(title: str, body: str, extra_labels: Optional[List[str]] = None, repo: Optional[str] = None) -> Dict[str, Any]:
+    owner, name = gh_repo_parts(repo)
     payload: Dict[str, Any] = {"title": title, "body": body}
     labels = parse_labels()
     if extra_labels:
@@ -417,16 +509,16 @@ def gh_create_issue(title: str, body: str, extra_labels: Optional[List[str]] = N
     if labels:
         payload["labels"] = labels
 
-    r = requests.post(f"{GH_API}/repos/{owner}/{repo}/issues", headers=gh_headers(), json=payload, timeout=30)
+    r = requests.post(f"{GH_API}/repos/{owner}/{name}/issues", headers=gh_headers(), json=payload, timeout=30)
     if r.status_code >= 300:
         raise RuntimeError(f"Create issue failed {r.status_code}: {r.text[:500]}")
     return r.json()
 
 
-def gh_update_issue(number: int, body: str) -> None:
-    owner, repo = gh_repo_parts()
+def gh_update_issue(number: int, body: str, repo: Optional[str] = None) -> None:
+    owner, name = gh_repo_parts(repo)
     r = requests.patch(
-        f"{GH_API}/repos/{owner}/{repo}/issues/{number}",
+        f"{GH_API}/repos/{owner}/{name}/issues/{number}",
         headers=gh_headers(),
         json={"body": body},
         timeout=30,
@@ -435,11 +527,11 @@ def gh_update_issue(number: int, body: str) -> None:
         raise RuntimeError(f"Update issue failed {r.status_code}: {r.text[:500]}")
 
 
-def gh_get_file(branch: str, path: str) -> Optional[Dict[str, str]]:
+def gh_get_file(branch: str, path: str, repo: Optional[str] = None) -> Optional[Dict[str, str]]:
     """Get file content and SHA from GitHub. Returns {"content": str, "sha": str} or None."""
-    owner, repo = gh_repo_parts()
+    owner, name = gh_repo_parts(repo)
     r = requests.get(
-        f"{GH_API}/repos/{owner}/{repo}/contents/{path}",
+        f"{GH_API}/repos/{owner}/{name}/contents/{path}",
         headers=gh_headers(),
         params={"ref": branch},
         timeout=30,
@@ -454,12 +546,12 @@ def gh_get_file(branch: str, path: str) -> Optional[Dict[str, str]]:
     return {"content": content, "sha": data["sha"]}
 
 
-def gh_update_file(branch: str, path: str, content: str, sha: str, message: str) -> bool:
+def gh_update_file(branch: str, path: str, content: str, sha: str, message: str, repo: Optional[str] = None) -> bool:
     """Update existing file on GitHub. Requires current SHA."""
-    owner, repo = gh_repo_parts()
+    owner, name = gh_repo_parts(repo)
     b64 = base64.b64encode(content.encode("utf-8")).decode("utf-8")
     r = requests.put(
-        f"{GH_API}/repos/{owner}/{repo}/contents/{path}",
+        f"{GH_API}/repos/{owner}/{name}/contents/{path}",
         headers=gh_headers(),
         json={"message": message, "content": b64, "branch": branch, "sha": sha},
         timeout=30,
@@ -470,9 +562,9 @@ def gh_update_file(branch: str, path: str, content: str, sha: str, message: str)
     return True
 
 
-def gh_mark_devlog_cherry_pick(branch: str, issue_number: int) -> bool:
+def gh_mark_devlog_cherry_pick(branch: str, issue_number: int, repo: Optional[str] = None) -> bool:
     """Mark an issue's entry in DEVLOG.md as cherry-pick candidate."""
-    file_data = gh_get_file(branch, "DEVLOG.md")
+    file_data = gh_get_file(branch, "DEVLOG.md", repo=repo)
     if not file_data:
         print(f"[GH] DEVLOG.md not found on {branch}")
         return False
@@ -522,14 +614,14 @@ def gh_mark_devlog_cherry_pick(branch: str, issue_number: int) -> bool:
 
     new_content = "".join(result_parts)
     return gh_update_file(branch, "DEVLOG.md", new_content, sha,
-                          f"Mark #{issue_number} for cherry-pick to main")
+                          f"Mark #{issue_number} for cherry-pick to main", repo=repo)
 
 
-def gh_add_label(number: int, label: str) -> bool:
+def gh_add_label(number: int, label: str, repo: Optional[str] = None) -> bool:
     """Add a label to an issue. Creates the label if it doesn't exist. Returns True on success."""
-    owner, repo = gh_repo_parts()
+    owner, name = gh_repo_parts(repo)
     r = requests.post(
-        f"{GH_API}/repos/{owner}/{repo}/issues/{number}/labels",
+        f"{GH_API}/repos/{owner}/{name}/issues/{number}/labels",
         headers=gh_headers(),
         json={"labels": [label]},
         timeout=30,
@@ -540,11 +632,11 @@ def gh_add_label(number: int, label: str) -> bool:
     return True
 
 
-def gh_remove_label(number: int, label: str) -> bool:
+def gh_remove_label(number: int, label: str, repo: Optional[str] = None) -> bool:
     """Remove a label from an issue. Returns True on success."""
-    owner, repo = gh_repo_parts()
+    owner, name = gh_repo_parts(repo)
     r = requests.delete(
-        f"{GH_API}/repos/{owner}/{repo}/issues/{number}/labels/{label}",
+        f"{GH_API}/repos/{owner}/{name}/issues/{number}/labels/{label}",
         headers=gh_headers(),
         timeout=30,
     )
@@ -554,11 +646,11 @@ def gh_remove_label(number: int, label: str) -> bool:
     return True
 
 
-def gh_list_issues_with_labels(labels: List[str], state: str = "open", direction: str = "asc") -> List[Dict[str, Any]]:
+def gh_list_issues_with_labels(labels: List[str], state: str = "open", direction: str = "asc", repo: Optional[str] = None) -> List[Dict[str, Any]]:
     """List issues with ALL specified labels. Returns oldest first by default."""
-    owner, repo = gh_repo_parts()
+    owner, name = gh_repo_parts(repo)
     r = requests.get(
-        f"{GH_API}/repos/{owner}/{repo}/issues",
+        f"{GH_API}/repos/{owner}/{name}/issues",
         headers=gh_headers(),
         params={"labels": ",".join(labels), "state": state, "sort": "created", "direction": direction, "per_page": 20},
         timeout=30,
@@ -703,53 +795,55 @@ def extract_image_from_message(msg: dict) -> Optional[Dict[str, Any]]:
 # Bot controls execution order by swapping labels one at a time.
 
 
-def queue_is_busy(branch: str) -> bool:
-    """Check if branch has active ticket. In-memory with GitHub API fallback (handles bot restart)."""
-    if ACTIVE_TICKET.get(branch) is not None:
+def queue_is_busy(repo: str, branch: str) -> bool:
+    """Check if (repo, branch) has active ticket. In-memory with GitHub API fallback (handles bot restart)."""
+    ctx = _ctx_key(repo, branch)
+    if ACTIVE_TICKET.get(ctx) is not None:
         return True
     # Fallback: check GitHub for issue with queue:execute label
     dev_label = _get_dev_label(branch)
     if not dev_label:
         return False
     try:
-        active_issues = gh_list_issues_with_labels(["queue:execute", dev_label])
+        active_issues = gh_list_issues_with_labels(["queue:execute", dev_label], repo=repo)
         if active_issues:
             issue = active_issues[0]
-            queue_set_active(branch, issue["number"], issue["title"])
-            print(f"[QUEUE] Recovered active ticket from GitHub: #{issue['number']}")
+            queue_set_active(repo, branch, issue["number"], issue["title"])
+            print(f"[QUEUE] Recovered active ticket from GitHub: #{issue['number']} ({repo})")
             return True
     except Exception as e:
         print(f"[QUEUE] GitHub fallback check failed: {e}")
     return False
 
 
-def queue_size(branch: str) -> int:
-    """Get count of pending tickets for branch from GitHub Issues."""
+def queue_size(repo: str, branch: str) -> int:
+    """Get count of pending tickets for (repo, branch) from GitHub Issues."""
     dev_label = _get_dev_label(branch)
     if not dev_label:
         return 0
     try:
-        pending = gh_list_issues_with_labels(["queue:pending", dev_label])
+        pending = gh_list_issues_with_labels(["queue:pending", dev_label], repo=repo)
         return len(pending)
     except Exception:
         return 0
 
 
-def queue_list_pending(branch: str) -> List[Dict[str, Any]]:
-    """List pending tickets for branch from GitHub Issues (oldest first)."""
+def queue_list_pending(repo: str, branch: str) -> List[Dict[str, Any]]:
+    """List pending tickets for (repo, branch) from GitHub Issues (oldest first)."""
     dev_label = _get_dev_label(branch)
     if not dev_label:
         return []
     try:
-        return gh_list_issues_with_labels(["queue:pending", dev_label])
+        return gh_list_issues_with_labels(["queue:pending", dev_label], repo=repo)
     except Exception:
         return []
 
 
-def queue_set_active(branch: str, issue_number: int, title: str) -> None:
+def queue_set_active(repo: str, branch: str, issue_number: int, title: str) -> None:
     """Mark ticket as active (in-memory tracking for /status)."""
-    ACTIVE_TICKET[branch] = {"issue_number": issue_number, "title": title}
-    CI_PROGRESS[branch] = {
+    ctx = _ctx_key(repo, branch)
+    ACTIVE_TICKET[ctx] = {"issue_number": issue_number, "title": title}
+    CI_PROGRESS[ctx] = {
         "started_at": now_ts(),
         "last_phase": "Запуск",
         "last_message": "",
@@ -761,25 +855,27 @@ def queue_set_active(branch: str, issue_number: int, title: str) -> None:
     }
 
 
-def queue_clear_active(branch: str) -> None:
+def queue_clear_active(repo: str, branch: str) -> None:
     """Clear active ticket. Removes queue:execute label so recovery doesn't find it."""
-    active = ACTIVE_TICKET.get(branch)
+    ctx = _ctx_key(repo, branch)
+    active = ACTIVE_TICKET.get(ctx)
     if active:
         try:
-            gh_remove_label(active["issue_number"], "queue:execute")
+            gh_remove_label(active["issue_number"], "queue:execute", repo=repo)
         except Exception as e:
             print(f"[QUEUE] Failed to remove queue:execute from #{active['issue_number']}: {e}")
-    ACTIVE_TICKET[branch] = None
-    CI_PROGRESS.pop(branch, None)
+    ACTIVE_TICKET[ctx] = None
+    CI_PROGRESS.pop(ctx, None)
 
 
-def queue_process_next(branch: str) -> Optional[Dict[str, Any]]:
+def queue_process_next(repo: str, branch: str) -> Optional[Dict[str, Any]]:
     """Activate next pending ticket by swapping labels. Triggers CI via labeled event."""
+    ctx = _ctx_key(repo, branch)
     dev_label = _get_dev_label(branch)
     if not dev_label:
         return None
     try:
-        pending = gh_list_issues_with_labels(["queue:pending", dev_label])
+        pending = gh_list_issues_with_labels(["queue:pending", dev_label], repo=repo)
         if not pending:
             return None
 
@@ -788,22 +884,23 @@ def queue_process_next(branch: str) -> Optional[Dict[str, Any]]:
         issue_title = issue["title"]
 
         # Swap labels: remove pending, add execute (triggers CI)
-        gh_remove_label(issue_number, "queue:pending")
-        ok = gh_add_label(issue_number, "queue:execute")
+        gh_remove_label(issue_number, "queue:pending", repo=repo)
+        ok = gh_add_label(issue_number, "queue:execute", repo=repo)
         if not ok:
             print(f"[QUEUE] Failed to add queue:execute to #{issue_number}")
             return None
 
         # Mark as active in memory
-        queue_set_active(branch, issue_number, issue_title)
+        queue_set_active(repo, branch, issue_number, issue_title)
 
         # Notify developer
-        dev_ctx = DEV_CHAT.get(branch)
+        dev_ctx = DEV_CHAT.get(ctx)
         if dev_ctx:
             remaining = len(pending) - 1
             queue_info = f"\n📋 В очереди ещё: {remaining}" if remaining > 0 else ""
+            repo_tag = f" [{_repo_short(repo)}]" if len(REPO_CONFIG) > 1 else ""
             tg_send_html(dev_ctx["chat_id"],
-                f"▶️ Следующий тикет: <a href=\"{issue['html_url']}\">#{issue_number}</a>\n"
+                f"▶️ Следующий тикет{repo_tag}: <a href=\"{issue['html_url']}\">#{issue_number}</a>\n"
                 f"{html_escape(issue_title)}{queue_info}")
 
         return issue
@@ -834,40 +931,43 @@ async def github_notify(req: Request):
 
     event = payload.get("event", "")
     branch = payload.get("branch", "")
+    repo = payload.get("repo") or GITHUB_REPO
     issue_number = payload.get("issue_number", "")
     issue_title = payload.get("issue_title", "")
+    ctx = _ctx_key(repo, branch)
 
-    print(f"[GH_NOTIFY] event={event} branch={branch} issue=#{issue_number}")
+    print(f"[GH_NOTIFY] event={event} branch={branch} repo={repo} issue=#{issue_number}")
 
-    dev_ctx = DEV_CHAT.get(branch)
+    dev_ctx = DEV_CHAT.get(ctx)
     if not dev_ctx:
         # Fallback: recover from DEVELOPER_MAP after bot restart
         fallback_uid = _BRANCH_TO_DEV.get(branch)
         if fallback_uid:
             dev_ctx = {"chat_id": fallback_uid, "user_id": fallback_uid, "first_name": "Dev"}
-            DEV_CHAT[branch] = dev_ctx
-            print(f"[GH_NOTIFY] Recovered DEV_CHAT for {branch} from DEVELOPER_MAP (uid={fallback_uid})")
+            DEV_CHAT[ctx] = dev_ctx
+            print(f"[GH_NOTIFY] Recovered DEV_CHAT for {ctx} from DEVELOPER_MAP (uid={fallback_uid})")
         else:
-            print(f"[GH_NOTIFY] No chat for branch={branch}, DEV_CHAT keys={list(DEV_CHAT.keys())}")
+            print(f"[GH_NOTIFY] No chat for {ctx}, DEV_CHAT keys={list(DEV_CHAT.keys())}")
             return {"ok": True, "skipped": "no chat"}
 
     chat_id = dev_ctx["chat_id"]
     mention = tg_mention(dev_ctx["user_id"], dev_ctx["first_name"])
+    repo_tag = f" [{_repo_short(repo)}]" if len(REPO_CONFIG) > 1 else ""
 
     safe_title = html_escape(issue_title)
     safe_branch = html_escape(branch)
 
     if event == "claude_started":
         # Mark as active (helps recover queue state after bot restart)
-        queue_set_active(branch, int(issue_number), issue_title)
+        queue_set_active(repo, branch, int(issue_number), issue_title)
 
         # Store CI options for /status step display
         options = payload.get("options", {})
-        if branch in CI_PROGRESS and options:
-            CI_PROGRESS[branch]["options"] = options
+        if ctx in CI_PROGRESS and options:
+            CI_PROGRESS[ctx]["options"] = options
 
         tg_send_html(chat_id,
-            f"🤖 Claude начал работу\n\n"
+            f"🤖 Claude начал работу{repo_tag}\n\n"
             f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}\n"
             f"Ветка: {safe_branch}")
     elif event == "phase":
@@ -876,17 +976,17 @@ async def github_notify(req: Request):
         silent = payload.get("silent", False)
 
         # Always update CI progress (for /status)
-        if branch in CI_PROGRESS:
+        if ctx in CI_PROGRESS:
             # Mark previous phase as done when new phase starts
-            prev = CI_PROGRESS[branch].get("current_phase_num", "")
+            prev = CI_PROGRESS[ctx].get("current_phase_num", "")
             if prev and prev != phase_num:
-                done_list = CI_PROGRESS[branch].get("phases_done", [])
+                done_list = CI_PROGRESS[ctx].get("phases_done", [])
                 if prev not in done_list:
                     done_list.append(prev)
-                CI_PROGRESS[branch]["phases_done"] = done_list
-            CI_PROGRESS[branch]["current_phase_num"] = phase_num
-            CI_PROGRESS[branch]["last_phase"] = phase_name
-            CI_PROGRESS[branch]["last_update_at"] = now_ts()
+                CI_PROGRESS[ctx]["phases_done"] = done_list
+            CI_PROGRESS[ctx]["current_phase_num"] = phase_num
+            CI_PROGRESS[ctx]["last_phase"] = phase_name
+            CI_PROGRESS[ctx]["last_update_at"] = now_ts()
 
         # Send TG notification unless silent (tracking-only)
         if not silent:
@@ -899,39 +999,40 @@ async def github_notify(req: Request):
             f"⚠️ Opus недоступен, переключаюсь на Sonnet\n\n"
             f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}")
     elif event == "claude_failed":
-        LAST_DEPLOY_URL.pop(branch, None)  # Clear stale deploy URL
+        LAST_DEPLOY_URL.pop(ctx, None)  # Clear stale deploy URL
         tg_send_html(chat_id,
             f"❌ Claude упал при работе над <b>#{issue_number}</b> ({html_escape(dev_ctx['first_name'])}): {safe_title}\n"
             f"Попробуй создать тикет ещё раз.")
         # Clear active and process queue
-        queue_clear_active(branch)
-        queue_process_next(branch)
+        queue_clear_active(repo, branch)
+        queue_process_next(repo, branch)
     elif event == "merged":
         # Include saved deploy URL if available
-        deploy_url = LAST_DEPLOY_URL.pop(branch, "")
+        deploy_url = LAST_DEPLOY_URL.pop(ctx, "")
         deploy_line = f"\n\n🔗 <a href=\"{deploy_url}\">Открыть билд</a>" if deploy_url else ""
 
         text = (
-            f"📦 Задача завершена — {safe_branch}\n\n"
+            f"📦 Задача завершена{repo_tag} — {safe_branch}\n\n"
             f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}"
             f"{deploy_line}")
 
         # Send with "cherry-pick to main" button
-        keyboard = [[{"text": "⭐ Забрать в main", "callback_data": f"pick:{issue_number}"}]]
+        keyboard = [[{"text": "⭐ Забрать в main", "callback_data": f"pick:{repo}:{issue_number}"}]]
         resp = tg_send_message_with_keyboard(chat_id, text, keyboard, parse_mode="HTML")
 
         # If no deploy URL yet, save message for Netlify to edit later
         if not deploy_url and resp and resp.get("ok"):
             msg_id = resp["result"]["message_id"]
-            RECENTLY_MERGED[branch] = {
+            RECENTLY_MERGED[ctx] = {
                 "chat_id": chat_id, "message_id": msg_id,
                 "text": text, "issue_number": issue_number,
+                "repo": repo,
                 "ts": time.time(),
             }
 
         # Clear active and process queue
-        queue_clear_active(branch)
-        queue_process_next(branch)
+        queue_clear_active(repo, branch)
+        queue_process_next(repo, branch)
     else:
         print(f"[GH_NOTIFY] Unknown event={event}")
         return {"ok": True, "skipped": "unknown event"}
@@ -948,16 +1049,18 @@ async def claude_message(req: Request):
         return {"ok": False, "error": "invalid json"}
 
     branch = payload.get("branch", "")
+    repo = payload.get("repo") or GITHUB_REPO
     issue_number = payload.get("issue_number", "")
     message_type = payload.get("type", "info")
     text = payload.get("text", "")
     phase_name = payload.get("phase_name", "")
+    ctx = _ctx_key(repo, branch)
 
-    print(f"[CLAUDE_MSG] type={message_type} branch={branch} issue=#{issue_number}")
+    print(f"[CLAUDE_MSG] type={message_type} branch={branch} repo={repo} issue=#{issue_number}")
     print(f"[CLAUDE_MSG] text={text[:200]}")
 
     # Track CI progress for /status command
-    if branch and branch in CI_PROGRESS:
+    if branch and ctx in CI_PROGRESS:
         # Update phase label only for definitive events (phases tracked via /github/notify)
         phase_update_types = {
             "test_pass": "Тесты OK", "test_fail": "Тесты упали",
@@ -965,7 +1068,7 @@ async def claude_message(req: Request):
             "done": "Завершено", "error": "Ошибка",
         }
         if message_type in phase_update_types:
-            CI_PROGRESS[branch]["last_phase"] = phase_update_types[message_type]
+            CI_PROGRESS[ctx]["last_phase"] = phase_update_types[message_type]
 
         # Clean up message for /status display
         clean_msg = text.replace('\\n', ' ').replace('\n', ' ').strip()
@@ -975,18 +1078,18 @@ async def claude_message(req: Request):
         stripped = clean_msg.lstrip()
         if stripped.startswith('[') or stripped.startswith('{'):
             clean_msg = ""
-        CI_PROGRESS[branch]["last_message"] = clean_msg[:150]
-        CI_PROGRESS[branch]["last_update_at"] = now_ts()
+        CI_PROGRESS[ctx]["last_message"] = clean_msg[:150]
+        CI_PROGRESS[ctx]["last_update_at"] = now_ts()
 
-    dev_ctx = DEV_CHAT.get(branch)
+    dev_ctx = DEV_CHAT.get(ctx)
     if not dev_ctx:
         fallback_uid = _BRANCH_TO_DEV.get(branch)
         if fallback_uid:
             dev_ctx = {"chat_id": fallback_uid, "user_id": fallback_uid, "first_name": "Dev"}
-            DEV_CHAT[branch] = dev_ctx
-            print(f"[CLAUDE_MSG] Recovered DEV_CHAT for {branch} from DEVELOPER_MAP (uid={fallback_uid})")
+            DEV_CHAT[ctx] = dev_ctx
+            print(f"[CLAUDE_MSG] Recovered DEV_CHAT for {ctx} from DEVELOPER_MAP (uid={fallback_uid})")
         else:
-            print(f"[CLAUDE_MSG] No chat for branch={branch}")
+            print(f"[CLAUDE_MSG] No chat for {ctx}")
             return {"ok": True, "skipped": "no chat"}
 
     chat_id = dev_ctx["chat_id"]
@@ -1053,35 +1156,37 @@ async def ci_request_approval(req: Request):
         return {"ok": False, "error": "invalid json"}
 
     branch = payload.get("branch", "")
+    repo = payload.get("repo") or GITHUB_REPO
     issue_number = payload.get("issue_number", "")
     plan_summary = payload.get("plan_summary", "")
+    ctx = _ctx_key(repo, branch)
 
-    approval_key = f"{branch}:{issue_number}"
+    approval_key = f"{repo}:{branch}:{issue_number}"
     APPROVAL_REQUESTS[approval_key] = {"status": "pending", "feedback": None}
 
     print(f"[APPROVAL] Requested: {approval_key}")
 
     # Track approval gate as phase "A" for /status
-    if branch in CI_PROGRESS:
-        prev = CI_PROGRESS[branch].get("current_phase_num", "")
+    if ctx in CI_PROGRESS:
+        prev = CI_PROGRESS[ctx].get("current_phase_num", "")
         if prev and prev != "A":
-            done_list = CI_PROGRESS[branch].get("phases_done", [])
+            done_list = CI_PROGRESS[ctx].get("phases_done", [])
             if prev not in done_list:
                 done_list.append(prev)
-            CI_PROGRESS[branch]["phases_done"] = done_list
-        CI_PROGRESS[branch]["current_phase_num"] = "A"
-        CI_PROGRESS[branch]["last_phase"] = "Ожидание апрува"
-        CI_PROGRESS[branch]["last_update_at"] = now_ts()
+            CI_PROGRESS[ctx]["phases_done"] = done_list
+        CI_PROGRESS[ctx]["current_phase_num"] = "A"
+        CI_PROGRESS[ctx]["last_phase"] = "Ожидание апрува"
+        CI_PROGRESS[ctx]["last_update_at"] = now_ts()
 
-    dev_ctx = DEV_CHAT.get(branch)
+    dev_ctx = DEV_CHAT.get(ctx)
     if not dev_ctx:
         fallback_uid = _BRANCH_TO_DEV.get(branch)
         if fallback_uid:
             dev_ctx = {"chat_id": fallback_uid, "user_id": fallback_uid, "first_name": "Dev"}
-            DEV_CHAT[branch] = dev_ctx
-            print(f"[APPROVAL] Recovered DEV_CHAT for {branch} from DEVELOPER_MAP (uid={fallback_uid})")
+            DEV_CHAT[ctx] = dev_ctx
+            print(f"[APPROVAL] Recovered DEV_CHAT for {ctx} from DEVELOPER_MAP (uid={fallback_uid})")
         else:
-            print(f"[APPROVAL] No chat for branch={branch} — auto-approving")
+            print(f"[APPROVAL] No chat for {ctx} — auto-approving")
             APPROVAL_REQUESTS[approval_key] = {"status": "approved", "feedback": None}
             return {"ok": True, "auto_approved": True}
 
@@ -1111,9 +1216,10 @@ async def ci_request_approval(req: Request):
 async def ci_check_approval(req: Request):
     """Polled by workflow to check if approval was granted."""
     branch = req.query_params.get("branch", "")
+    repo = req.query_params.get("repo") or GITHUB_REPO
     issue_number = req.query_params.get("issue_number", "")
 
-    approval_key = f"{branch}:{issue_number}"
+    approval_key = f"{repo}:{branch}:{issue_number}"
     entry = APPROVAL_REQUESTS.get(approval_key)
 
     if not entry:
@@ -1145,24 +1251,26 @@ async def netlify_webhook(req: Request):
 
     state = payload.get("state", "")
     branch = payload.get("branch", "")
+    repo = payload.get("repo") or GITHUB_REPO
     site_name = payload.get("name", "")
     ssl_url = payload.get("ssl_url", "")
     error_message = payload.get("error_message", "")
     commit_msg = payload.get("title", "")
+    ctx = _ctx_key(repo, branch)
 
-    print(f"[NETLIFY] state={state} branch={branch} site={site_name}")
+    print(f"[NETLIFY] state={state} branch={branch} repo={repo} site={site_name}")
     print(f"[NETLIFY] DEV_CHAT keys={list(DEV_CHAT.keys())}")
 
     # Находим контекст разработчика
-    dev_ctx = DEV_CHAT.get(branch)
+    dev_ctx = DEV_CHAT.get(ctx)
     if not dev_ctx:
         fallback_uid = _BRANCH_TO_DEV.get(branch)
         if fallback_uid:
             dev_ctx = {"chat_id": fallback_uid, "user_id": fallback_uid, "first_name": "Dev"}
-            DEV_CHAT[branch] = dev_ctx
-            print(f"[NETLIFY] Recovered DEV_CHAT for {branch} from DEVELOPER_MAP (uid={fallback_uid})")
+            DEV_CHAT[ctx] = dev_ctx
+            print(f"[NETLIFY] Recovered DEV_CHAT for {ctx} from DEVELOPER_MAP (uid={fallback_uid})")
         else:
-            print(f"[NETLIFY] No chat for branch={branch}, skipping")
+            print(f"[NETLIFY] No chat for {ctx}, skipping")
             return {"ok": True, "skipped": "no chat mapped"}
 
     chat_id = dev_ctx["chat_id"]
@@ -1176,9 +1284,9 @@ async def netlify_webhook(req: Request):
         # If CI is actively working on this branch — ALWAYS save URL, don't notify yet
         # Must be checked FIRST: DEVLOG/screenshot/merge commits still produce valid deploys
         # and the URL should be included in the final "done" notification
-        if queue_is_busy(branch):
-            LAST_DEPLOY_URL[branch] = ssl_url
-            print(f"[NETLIFY] CI active on {branch} — saved deploy URL (commit: {commit_msg})")
+        if queue_is_busy(repo, branch):
+            LAST_DEPLOY_URL[ctx] = ssl_url
+            print(f"[NETLIFY] CI active on {ctx} — saved deploy URL (commit: {commit_msg})")
             return {"ok": True, "skipped": "ci_active", "deploy_url_saved": True}
 
         # Skip deploy notifications for screenshot uploads (not real code changes)
@@ -1199,7 +1307,7 @@ async def netlify_webhook(req: Request):
             return {"ok": True, "skipped": "devlog update"}
 
         # Check if this is a deploy from branch just created from main
-        created_at = BRANCH_JUST_CREATED.pop(branch, 0)
+        created_at = BRANCH_JUST_CREATED.pop(ctx, 0)
         if created_at and (time.time() - created_at) < 120:
             print(f"[NETLIFY] Branch {branch} just created from main, sending info message")
             tg_send_html(chat_id,
@@ -1207,10 +1315,11 @@ async def netlify_webhook(req: Request):
             return {"ok": True, "notified": True}
 
         # If task just finished (merged), edit the "📦 Задача завершена" message to add deploy link
-        merged_info = RECENTLY_MERGED.pop(branch, None)
+        merged_info = RECENTLY_MERGED.pop(ctx, None)
         if merged_info and (time.time() - merged_info["ts"]) < 180:
             updated_text = merged_info["text"] + f"\n\n🔗 <a href=\"{ssl_url}\">Открыть билд</a>"
-            keyboard = [[{"text": "⭐ Забрать в main", "callback_data": f"pick:{merged_info['issue_number']}"}]]
+            pick_repo = merged_info.get("repo", repo)
+            keyboard = [[{"text": "⭐ Забрать в main", "callback_data": f"pick:{pick_repo}:{merged_info['issue_number']}"}]]
             tg_edit_message_with_keyboard(
                 merged_info["chat_id"], merged_info["message_id"],
                 updated_text, keyboard, parse_mode="HTML",
@@ -1278,18 +1387,25 @@ async def telegram_webhook(req: Request):
             return {"ok": True}
 
         # --- Cherry-pick marking (not tied to PENDING) ---
+        # Format: pick:owner/repo:issue_number OR pick:issue_number (backward compat)
         if data.startswith("pick:"):
-            pick_issue = data.split(":", 1)[1]
+            pick_parts = data.split(":", 1)[1]
+            # Parse repo and issue: "owner/repo:123" or just "123"
+            if "/" in pick_parts and ":" in pick_parts:
+                pick_repo, pick_issue = pick_parts.rsplit(":", 1)
+            else:
+                pick_repo = GITHUB_REPO
+                pick_issue = pick_parts
             try:
                 issue_num = int(pick_issue)
-                ok = gh_add_label(issue_num, "cherry-pick")
+                ok = gh_add_label(issue_num, "cherry-pick", repo=pick_repo)
                 if ok:
                     # Also update DEVLOG.md on the dev branch
                     dev_info = DEVELOPER_MAP.get(clicker_id)
                     if dev_info:
-                        devlog_ok = gh_mark_devlog_cherry_pick(dev_info["branch"], issue_num)
+                        devlog_ok = gh_mark_devlog_cherry_pick(dev_info["branch"], issue_num, repo=pick_repo)
                         if devlog_ok:
-                            print(f"[PICK] DEVLOG.md updated for #{issue_num} on {dev_info['branch']}")
+                            print(f"[PICK] DEVLOG.md updated for #{issue_num} on {dev_info['branch']} ({pick_repo})")
                         else:
                             print(f"[PICK] DEVLOG.md update failed for #{issue_num}")
 
@@ -1299,7 +1415,7 @@ async def telegram_webhook(req: Request):
                         msg_obj.get("text", "") + "\n\n⭐ Помечен для переноса в main",
                         [],  # remove keyboard
                     )
-                    print(f"[PICK] Issue #{issue_num} marked for cherry-pick by user={clicker_id}")
+                    print(f"[PICK] Issue #{issue_num} marked for cherry-pick by user={clicker_id} ({pick_repo})")
                 else:
                     tg_send_message(chat_id, f"Не удалось пометить #{pick_issue}", reply_to_message_id=reply_to_id)
             except Exception as e:
@@ -1311,7 +1427,7 @@ async def telegram_webhook(req: Request):
         if data.startswith("ci_ok:") or data.startswith("ci_no:") or data.startswith("ci_edit:"):
             ci_issue = data.split(":", 1)[1]
 
-            # Find approval key for this issue across all branches
+            # Find approval key for this issue across all repos/branches
             target_key = None
             for key_candidate, entry in APPROVAL_REQUESTS.items():
                 entry_status = entry.get("status") if isinstance(entry, dict) else entry
@@ -1367,25 +1483,27 @@ async def telegram_webhook(req: Request):
                 tg_send_message(chat_id, "Dev-ветка не найдена.", reply_to_message_id=reply_to_id)
                 return {"ok": True}
             branch = dev_info["branch"]
+            reset_repo = resolve_repo(chat_id, clicker_id)
+            default_br = _default_branch(reset_repo)
             try:
-                # Auto-backup: tag the branch before resetting (skip if already at main)
+                # Auto-backup: tag the branch before resetting (skip if already at default)
                 backup_note = ""
                 try:
-                    branch_sha = gh_get_branch_sha(branch)
-                    main_sha = gh_get_branch_sha("main")
+                    branch_sha = gh_get_branch_sha(branch, repo=reset_repo)
+                    main_sha = gh_get_branch_sha(default_br, repo=reset_repo)
                     if branch_sha != main_sha:
                         short_name = branch.split("/")[-1]  # "dev/Gleb" → "Gleb"
                         tag_name = f"backup/{short_name}/{time.strftime('%Y-%m-%d')}-{branch_sha[:7]}"
-                        gh_create_tag(tag_name, branch_sha)
+                        gh_create_tag(tag_name, branch_sha, repo=reset_repo)
                         backup_note = f"\n📦 Бэкап: `{tag_name}`"
                 except Exception as tag_err:
                     print(f"[RESET] Backup tag failed (non-fatal): {tag_err}")
                     backup_note = "\n⚠️ Бэкап не удался (ветка всё равно сброшена)"
 
-                sha = gh_force_reset_branch(branch, "main")
+                sha = gh_force_reset_branch(branch, default_br, repo=reset_repo)
                 short_sha = sha[:7]
-                print(f"[RESET] user={clicker_id} branch={branch} → main ({short_sha})")
-                tg_send_message(chat_id, f"✅ Ветка `{branch}` сброшена до `main` ({short_sha}).{backup_note}", reply_to_message_id=reply_to_id)
+                print(f"[RESET] user={clicker_id} branch={branch} → {default_br} ({short_sha}) repo={reset_repo}")
+                tg_send_message(chat_id, f"✅ Ветка `{branch}` сброшена до `{default_br}` ({short_sha}).{backup_note}", reply_to_message_id=reply_to_id)
             except Exception as e:
                 print(f"[RESET] ERROR user={clicker_id} branch={branch}: {e}")
                 tg_send_message(chat_id, f"❌ Ошибка: {type(e).__name__}\n{e}", reply_to_message_id=reply_to_id)
@@ -1442,6 +1560,13 @@ async def telegram_webhook(req: Request):
                 dev_info = DEVELOPER_MAP.get(clicker_id)
                 extra_labels: List[str] = []
                 branch = None
+                target_repo = resolve_repo(chat_id, clicker_id)
+
+                if not target_repo:
+                    tg_send_message(chat_id, "Выбери репозиторий: /repo", reply_to_message_id=reply_to_id)
+                    return {"ok": True}
+
+                default_br = _default_branch(target_repo)
 
                 # Add CI option labels
                 opts = state.get("options", DEFAULT_OPTIONS)
@@ -1452,33 +1577,34 @@ async def telegram_webhook(req: Request):
                 if dev_info:
                     branch = dev_info["branch"]
                     extra_labels.append(dev_info["label"])
-                    # Ensure dev branch exists (create from main if deleted after merge)
-                    if not gh_branch_exists(branch):
+                    ctx = _ctx_key(target_repo, branch)
+                    # Ensure dev branch exists (create from default if deleted after merge)
+                    if not gh_branch_exists(branch, repo=target_repo):
                         try:
-                            gh_create_branch(branch, "main")
-                            BRANCH_JUST_CREATED[branch] = time.time()
+                            gh_create_branch(branch, default_br, repo=target_repo)
+                            BRANCH_JUST_CREATED[ctx] = time.time()
                         except Exception as e:
-                            print(f"[CREATE] Failed to create branch {branch}: {e}")
+                            print(f"[CREATE] Failed to create branch {branch} in {target_repo}: {e}")
                     # Запоминаем chat_id ТОЛЬКО при создании тикета
-                    DEV_CHAT[branch] = {
+                    DEV_CHAT[ctx] = {
                         "chat_id": chat_id,
                         "user_id": clicker_id,
                         "first_name": from_user.get("first_name", ""),
                     }
-                    print(f"[CREATE] Developer: user={clicker_id} → branch={branch} label={dev_info['label']} chat={chat_id}")
-                    print(f"[CREATE] DEV_CHAT updated: {branch} → chat_id={chat_id}")
+                    print(f"[CREATE] Developer: user={clicker_id} → branch={branch} label={dev_info['label']} chat={chat_id} repo={target_repo}")
+                    print(f"[CREATE] DEV_CHAT updated: {ctx} → chat_id={chat_id}")
                 else:
                     print(f"[CREATE] No developer mapping for user={clicker_id}, using default branch")
 
                 issue_fmt = format_issue(state["text"], chat_id, from_user, dev_info=dev_info)
-                
+
                 # Decide: queue (pending) or execute immediately
-                is_busy = branch and queue_is_busy(branch)
+                is_busy = branch and queue_is_busy(target_repo, branch)
                 if is_busy:
                     extra_labels.append("queue:pending")
 
                 # Create issue on GitHub (with queue:pending if busy, without if free)
-                issue = gh_create_issue(issue_fmt["title"], issue_fmt["body"], extra_labels=extra_labels)
+                issue = gh_create_issue(issue_fmt["title"], issue_fmt["body"], extra_labels=extra_labels, repo=target_repo)
                 issue_url = issue["html_url"]
                 issue_number = issue["number"]
                 issue_body = issue_fmt["body"]
@@ -1491,7 +1617,7 @@ async def telegram_webhook(req: Request):
                 # Upload screenshot if present
                 if state.get("screenshot"):
                     if not chosen_branch:
-                        chosen_branch = gh_get_default_branch()
+                        chosen_branch = gh_get_default_branch(repo=target_repo)
                         branch_info = f"\nBranch: `{chosen_branch}` (default)"
 
                     shot = state["screenshot"]
@@ -1507,20 +1633,24 @@ async def telegram_webhook(req: Request):
                         path=path_in_repo,
                         content_bytes=img_bytes,
                         message=f"Add screenshot for issue #{issue_number}",
+                        repo=target_repo,
                     )
                     screenshot_info = f"\nScreenshot: {html_url}"
 
                 if branch_info or screenshot_info:
                     updated_body = issue_body + "\n\n---\n" + (branch_info + screenshot_info).strip()
-                    gh_update_issue(issue_number, updated_body)
+                    gh_update_issue(issue_number, updated_body, repo=target_repo)
+
+                repo_tag = f" [{_repo_short(target_repo)}]" if len(REPO_CONFIG) > 1 else ""
 
                 if is_busy:
                     # Issue created with queue:pending — notify about queue position
-                    pending_count = queue_size(branch)
-                    active = ACTIVE_TICKET.get(branch, {})
+                    pending_count = queue_size(target_repo, branch)
+                    ctx = _ctx_key(target_repo, branch)
+                    active = ACTIVE_TICKET.get(ctx, {})
                     active_num = active.get("issue_number", "?") if active else "?"
                     tg_send_html(chat_id,
-                        f"📋 Тикет <a href=\"{issue_url}\">#{issue_number}</a> добавлен в очередь\n\n"
+                        f"📋 Тикет{repo_tag} <a href=\"{issue_url}\">#{issue_number}</a> добавлен в очередь\n\n"
                         f"Позиция: {pending_count}\n"
                         f"Сейчас выполняется: #{active_num}\n\n"
                         f"Тикет запустится автоматически когда подойдёт очередь.",
@@ -1528,17 +1658,17 @@ async def telegram_webhook(req: Request):
                 else:
                     # Issue created without queue label — trigger CI now
                     if branch:
-                        gh_add_label(issue_number, "queue:execute")
-                        queue_set_active(branch, issue_number, issue_fmt["title"])
+                        gh_add_label(issue_number, "queue:execute", repo=target_repo)
+                        queue_set_active(target_repo, branch, issue_number, issue_fmt["title"])
 
                     queue_info = ""
                     if branch:
-                        remaining = queue_size(branch)
+                        remaining = queue_size(target_repo, branch)
                         if remaining > 0:
                             queue_info = f"\n\n📋 В очереди: {remaining}"
 
                     tg_send_message(chat_id,
-                        f"📋 Тикет создан!\n\n"
+                        f"📋 Тикет создан!{repo_tag}\n\n"
                         f"#{issue_number} ({from_user.get('first_name', '')}): {issue_fmt['title']}\n"
                         f"{issue_url}\n\n"
                         f"Claude скоро возьмётся за работу...{queue_info}",
@@ -1577,10 +1707,37 @@ async def telegram_webhook(req: Request):
     # Help
     cmd_base = text.lower().split("@")[0]
     if cmd_base in ("/start", "/help", "help"):
+        repo_cmd = "\n/repo — выбрать репозиторий" if len(REPO_CONFIG) > 1 else ""
         if in_group and REQUIRE_TICKET_COMMAND:
-            tg_send_message(chat_id, "В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/status — статус текущего тикета\n/queue — очередь тикетов\n/apps — открыть приложения\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
+            tg_send_message(chat_id, f"В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/status — статус текущего тикета\n/queue — очередь тикетов\n/apps — открыть приложения\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку{repo_cmd}", reply_to_message_id=message_id)
         else:
-            tg_send_message(chat_id, "Пришли голосовое (или /ticket <текст>) — я создам GitHub Issue.\n/status — статус текущего тикета\n/queue — очередь тикетов\n/apps — открыть приложения\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку до main", reply_to_message_id=message_id)
+            tg_send_message(chat_id, f"Пришли голосовое (или /ticket <текст>) — я создам GitHub Issue.\n/status — статус текущего тикета\n/queue — очередь тикетов\n/apps — открыть приложения\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку{repo_cmd}", reply_to_message_id=message_id)
+        return {"ok": True}
+
+    # Repo selection (multi-repo)
+    if cmd_base == "/repo" or text.lower().startswith("/repo "):
+        arg = text.split(maxsplit=1)[1].strip() if " " in text else ""
+        if not arg:
+            # Show current + list
+            current = USER_ACTIVE_REPO.get(user_id) or GITHUB_REPO or "(не задан)"
+            lines = [f"Активный репо: {current}\n"]
+            if REPO_CONFIG:
+                lines.append("Доступные:")
+                for repo_name, cfg in REPO_CONFIG.items():
+                    marker = " ← текущий" if repo_name == current else ""
+                    lines.append(f"  /{cfg['short']} — {repo_name}{marker}")
+            else:
+                lines.append("Multi-repo не настроен (GITHUB_REPOS не задан)")
+            tg_send_message(chat_id, "\n".join(lines), reply_to_message_id=message_id)
+        else:
+            # Set by short name or full name
+            target = SHORT_TO_REPO.get(arg.lower()) or (arg if arg in REPO_CONFIG else None)
+            if target:
+                USER_ACTIVE_REPO[user_id] = target
+                tg_send_message(chat_id, f"Репо: {target} ({_repo_short(target)})", reply_to_message_id=message_id)
+            else:
+                available = ", ".join(f"/{cfg['short']}" for cfg in REPO_CONFIG.values()) or "(нет)"
+                tg_send_message(chat_id, f"Неизвестный репо: {arg}\nДоступные: {available}", reply_to_message_id=message_id)
         return {"ok": True}
 
     # Apps menu
@@ -1593,10 +1750,18 @@ async def telegram_webhook(req: Request):
     if cmd_base == "/debug":
         uptime = int(time.time()) - BOT_STARTED_AT
         mins = uptime // 60
-        
+
         # Queue stats
-        active_branches = [b for b, t in ACTIVE_TICKET.items() if t is not None]
-        
+        active_contexts = [k for k, t in ACTIVE_TICKET.items() if t is not None]
+
+        # Repos info
+        repos_info = []
+        for rname, cfg in REPO_CONFIG.items():
+            repos_info.append(f"  {cfg['short']}: {rname} (default: {cfg['default_branch']})")
+        repos_str = "\n".join(repos_info) if repos_info else "(single repo mode)"
+
+        current_repo = resolve_repo(chat_id, user_id)
+
         debug_text = (
             f"🔧 Bot debug\n"
             f"Version: {BOT_VERSION}\n"
@@ -1605,13 +1770,15 @@ async def telegram_webhook(req: Request):
             f"Pending tickets: {len(PENDING)}\n"
             f"Armed users: {len(ARMED)}\n"
             f"Queue: GitHub Issues (queue:pending/queue:execute)\n"
-            f"Active branches: {active_branches or '—'}\n"
+            f"Active contexts: {active_contexts or '—'}\n"
             f"---\n"
-            f"GITHUB_REPO: {GITHUB_REPO or '(empty)'}\n"
+            f"REPOS:\n{repos_str}\n"
+            f"CHAT_TO_REPO: {CHAT_TO_REPO or '(empty)'}\n"
+            f"Current repo: {current_repo}\n"
             f"WEBAPP_PROD: {'✅' if WEBAPP_URL_PRODUCTION else '❌'}\n"
             f"WEBAPP_DEV1: {'✅' if WEBAPP_URL_DEV_1 else '❌'} {WEBAPP_DEV_1_NAME}\n"
             f"WEBAPP_DEV2: {'✅' if WEBAPP_URL_DEV_2 else '❌'} {WEBAPP_DEV_2_NAME}\n"
-            f"DEV_CHAT: {DEV_CHAT or '(empty)'}\n"
+            f"DEV_CHAT: {dict(list(DEV_CHAT.items())[:5]) or '(empty)'}\n"
             f"REQUIRE_TICKET_CMD: {REQUIRE_TICKET_COMMAND}\n"
             f"Group chat: {in_group}\n"
             f"---\n"
@@ -1623,20 +1790,23 @@ async def telegram_webhook(req: Request):
         tg_send_message(chat_id, debug_text, reply_to_message_id=message_id)
         return {"ok": True}
 
-    # Reset dev branch to main
+    # Reset dev branch to default
     if cmd_base == "/reset":
         dev_info = DEVELOPER_MAP.get(user_id)
         if not dev_info:
             tg_send_message(chat_id, "У тебя нет привязанной dev-ветки. Проверь DEVELOPER_MAP.", reply_to_message_id=message_id)
             return {"ok": True}
         branch = dev_info["branch"]
+        reset_repo = resolve_repo(chat_id, user_id)
+        default_br = _default_branch(reset_repo)
+        repo_tag = f" [{_repo_short(reset_repo)}]" if len(REPO_CONFIG) > 1 else ""
         keyboard = [
             [{"text": f"⚠️ Да, перезатереть {branch}", "callback_data": f"reset_confirm:{user_id}"}],
             [{"text": "Отмена", "callback_data": f"reset_cancel:{user_id}"}],
         ]
         tg_send_message_with_keyboard(
             chat_id,
-            f"Ты уверен? Ветка `{branch}` будет полностью заменена на текущий `main`.\n\n"
+            f"Ты уверен?{repo_tag} Ветка `{branch}` будет полностью заменена на текущий `{default_br}`.\n\n"
             f"Все незамерженные изменения в `{branch}` будут потеряны!",
             keyboard,
             reply_to_message_id=message_id,
@@ -1650,33 +1820,37 @@ async def telegram_webhook(req: Request):
             tg_send_message(chat_id, "У тебя нет привязанной dev-ветки.", reply_to_message_id=message_id)
             return {"ok": True}
         branch = dev_info["branch"]
-        queue_is_busy(branch)  # triggers recovery if needed
-        active = ACTIVE_TICKET.get(branch)
-        pending_count = queue_size(branch)
+        clear_repo = resolve_repo(chat_id, user_id)
+        ctx = _ctx_key(clear_repo, branch)
+        queue_is_busy(clear_repo, branch)  # triggers recovery if needed
+        active = ACTIVE_TICKET.get(ctx)
+        pending_count = queue_size(clear_repo, branch)
+
+        repo_tag = f" [{_repo_short(clear_repo)}]" if len(REPO_CONFIG) > 1 else ""
 
         if not active and pending_count == 0:
-            tg_send_message(chat_id, f"Очередь {branch} уже пуста, нечего очищать.", reply_to_message_id=message_id)
+            tg_send_message(chat_id, f"Очередь{repo_tag} {branch} уже пуста, нечего очищать.", reply_to_message_id=message_id)
             return {"ok": True}
 
         # Clear active ticket and stale deploy URL
-        queue_clear_active(branch)
-        LAST_DEPLOY_URL.pop(branch, None)
+        queue_clear_active(clear_repo, branch)
+        LAST_DEPLOY_URL.pop(ctx, None)
 
         # Process queued tickets if any
         if pending_count > 0:
-            next_issue = queue_process_next(branch)
+            next_issue = queue_process_next(clear_repo, branch)
             if next_issue:
                 tg_send_message(chat_id,
-                    f"🧹 Очередь {branch} очищена (был активен #{active['issue_number'] if active else '?'})\n"
+                    f"🧹 Очередь{repo_tag} {branch} очищена (был активен #{active['issue_number'] if active else '?'})\n"
                     f"▶️ Запущен следующий тикет из очереди",
                     reply_to_message_id=message_id)
             else:
                 tg_send_message(chat_id,
-                    f"🧹 Очередь {branch} очищена, но следующий тикет не удалось создать.",
+                    f"🧹 Очередь{repo_tag} {branch} очищена, но следующий тикет не удалось создать.",
                     reply_to_message_id=message_id)
         else:
             tg_send_message(chat_id,
-                f"🧹 Активный тикет #{active['issue_number'] if active else '?'} снят с {branch}. Очередь пуста.",
+                f"🧹 Активный тикет #{active['issue_number'] if active else '?'} снят с{repo_tag} {branch}. Очередь пуста.",
                 reply_to_message_id=message_id)
         return {"ok": True}
 
@@ -1687,12 +1861,15 @@ async def telegram_webhook(req: Request):
             tg_send_message(chat_id, "У тебя нет привязанной dev-ветки.", reply_to_message_id=message_id)
             return {"ok": True}
         branch = dev_info["branch"]
+        q_repo = resolve_repo(chat_id, user_id)
+        ctx = _ctx_key(q_repo, branch)
+        repo_tag = f" [{_repo_short(q_repo)}]" if len(REPO_CONFIG) > 1 else ""
         # Check active (in-memory + GitHub fallback)
-        queue_is_busy(branch)  # triggers recovery if needed
-        active = ACTIVE_TICKET.get(branch)
-        pending = queue_list_pending(branch)
+        queue_is_busy(q_repo, branch)  # triggers recovery if needed
+        active = ACTIVE_TICKET.get(ctx)
+        pending = queue_list_pending(q_repo, branch)
 
-        lines = [f"📋 Очередь для {branch}\n"]
+        lines = [f"📋 Очередь для{repo_tag} {branch}\n"]
 
         if active:
             lines.append(f"▶️ Выполняется: #{active['issue_number']} — {active['title'][:50]}")
@@ -1718,13 +1895,16 @@ async def telegram_webhook(req: Request):
             tg_send_message(chat_id, "У тебя нет привязанной dev-ветки.", reply_to_message_id=message_id)
             return {"ok": True}
         branch = dev_info["branch"]
-        queue_is_busy(branch)  # triggers recovery from GitHub if needed after bot restart
-        active = ACTIVE_TICKET.get(branch)
-        progress = CI_PROGRESS.get(branch)
-        pending = queue_list_pending(branch)
-        deploy_url = LAST_DEPLOY_URL.get(branch)
+        s_repo = resolve_repo(chat_id, user_id)
+        ctx = _ctx_key(s_repo, branch)
+        repo_tag = f" [{_repo_short(s_repo)}]" if len(REPO_CONFIG) > 1 else ""
+        queue_is_busy(s_repo, branch)  # triggers recovery from GitHub if needed after bot restart
+        active = ACTIVE_TICKET.get(ctx)
+        progress = CI_PROGRESS.get(ctx)
+        pending = queue_list_pending(s_repo, branch)
+        deploy_url = LAST_DEPLOY_URL.get(ctx)
 
-        lines: List[str] = [f"📊 Статус — {branch}\n"]
+        lines: List[str] = [f"📊 Статус{repo_tag} — {branch}\n"]
 
         if active:
             lines.append(f"▶️ Тикет: #{active['issue_number']} — {active['title'][:60]}")
