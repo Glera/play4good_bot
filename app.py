@@ -189,7 +189,7 @@ def _repo_short(repo: str) -> str:
 
 
 # Debug / versioning
-BOT_VERSION = "0.18.0"  # ← /help, /apps multi-repo, playground URLs, repo fix
+BOT_VERSION = "0.18.1"  # ← suppress deploy after /reset
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -1362,13 +1362,12 @@ async def netlify_webhook(req: Request):
             print(f"[NETLIFY] Skipping deploy notification for DEVLOG/cherry-pick update: {commit_msg}")
             return {"ok": True, "skipped": "devlog update"}
 
-        # Check if this is a deploy from branch just created from main
+        # Check if this is a deploy from branch just created/reset from main — save URL silently
         created_at = BRANCH_JUST_CREATED.pop(ctx, 0)
         if created_at and (time.time() - created_at) < 120:
-            print(f"[NETLIFY] Branch {branch} just created from main, sending info message")
-            tg_send_html(chat_id,
-                f"🔄 Ветка {safe_branch} создана из main, деплой синхронизирован")
-            return {"ok": True, "notified": True}
+            LAST_DEPLOY_URL[ctx] = _netlify_app_url(ssl_url, site_name)
+            print(f"[NETLIFY] Branch {branch} just created/reset — saved deploy URL silently")
+            return {"ok": True, "skipped": "branch_just_created", "deploy_url_saved": True}
 
         # If task just finished (merged), edit the "📦 Задача завершена" message to add deploy link
         merged_info = RECENTLY_MERGED.pop(ctx, None)
@@ -1560,6 +1559,9 @@ async def telegram_webhook(req: Request):
 
                 sha = gh_force_reset_branch(branch, default_br, repo=reset_repo)
                 short_sha = sha[:7]
+                # Suppress Netlify deploy notification after reset (it's just a sync from main)
+                ctx = _ctx_key(reset_repo, branch)
+                BRANCH_JUST_CREATED[ctx] = time.time()
                 print(f"[RESET] user={clicker_id} branch={branch} → {default_br} ({short_sha}) repo={reset_repo}")
                 tg_send_message(chat_id, f"✅ Ветка `{branch}` сброшена до `{default_br}` ({short_sha}).{backup_note}", reply_to_message_id=reply_to_id)
             except Exception as e:
