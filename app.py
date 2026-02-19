@@ -67,7 +67,7 @@ DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 _BRANCH_TO_DEV: Dict[str, int] = {info["branch"]: uid for uid, info in DEVELOPER_MAP.items()}
 
 # Debug / versioning
-BOT_VERSION = "0.13.1"  # ← fix model name in notifications
+BOT_VERSION = "0.13.2"  # ← fix deploy URL when CI active + DEVLOG commit
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -1098,6 +1098,14 @@ async def netlify_webhook(req: Request):
     safe_commit = html_escape(commit_msg) if commit_msg else ""
 
     if state == "ready":
+        # If CI is actively working on this branch — ALWAYS save URL, don't notify yet
+        # Must be checked FIRST: DEVLOG/screenshot/merge commits still produce valid deploys
+        # and the URL should be included in the final "done" notification
+        if queue_is_busy(branch):
+            LAST_DEPLOY_URL[branch] = ssl_url
+            print(f"[NETLIFY] CI active on {branch} — saved deploy URL (commit: {commit_msg})")
+            return {"ok": True, "skipped": "ci_active", "deploy_url_saved": True}
+
         # Skip deploy notifications for screenshot uploads (not real code changes)
         if commit_msg and "Add screenshot for issue" in commit_msg:
             print(f"[NETLIFY] Skipping deploy notification for screenshot commit: {commit_msg}")
@@ -1122,13 +1130,6 @@ async def netlify_webhook(req: Request):
             tg_send_html(chat_id,
                 f"🔄 Ветка {safe_branch} создана из main, деплой синхронизирован")
             return {"ok": True, "notified": True}
-
-        # If CI is actively working on this branch — save URL, don't notify yet
-        # The deploy URL will be included in the final "done" notification
-        if queue_is_busy(branch):
-            LAST_DEPLOY_URL[branch] = ssl_url
-            print(f"[NETLIFY] CI active on {branch} — saved deploy URL, suppressing notification")
-            return {"ok": True, "skipped": "ci_active", "deploy_url_saved": True}
 
         # If task just finished (merged), edit the "📦 Задача завершена" message to add deploy link
         merged_info = RECENTLY_MERGED.pop(branch, None)
