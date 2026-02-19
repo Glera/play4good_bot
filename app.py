@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import base64
 import tempfile
@@ -154,7 +155,28 @@ if not REPO_CONFIG and GITHUB_REPO:
     SHORT_TO_REPO[GITHUB_REPO.split("/")[-1]] = GITHUB_REPO
 
 # Runtime: user → active repo (set by /repo command in personal chats)
-USER_ACTIVE_REPO: Dict[int, str] = {}
+# Persisted to JSON file to survive bot restarts
+_USER_REPO_FILE = os.path.join(os.path.dirname(__file__), ".user_active_repo.json")
+
+def _load_user_active_repo() -> Dict[int, str]:
+    try:
+        with open(_USER_REPO_FILE, "r") as f:
+            data = json.load(f)
+            # JSON keys are strings, convert back to int
+            return {int(k): v for k, v in data.items() if v in REPO_CONFIG}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {}
+
+def _save_user_active_repo():
+    try:
+        with open(_USER_REPO_FILE, "w") as f:
+            json.dump({str(k): v for k, v in USER_ACTIVE_REPO.items()}, f)
+    except OSError as e:
+        print(f"[WARN] Failed to save USER_ACTIVE_REPO: {e}")
+
+USER_ACTIVE_REPO: Dict[int, str] = _load_user_active_repo()
+if USER_ACTIVE_REPO:
+    print(f"[BOT] Restored USER_ACTIVE_REPO: {USER_ACTIVE_REPO}")
 
 
 def resolve_repo(chat_id: int, user_id: int) -> Optional[str]:
@@ -189,7 +211,7 @@ def _repo_short(repo: str) -> str:
 
 
 # Debug / versioning
-BOT_VERSION = "0.18.2"  # ← fix duplicate merged + post-completion deploy noise
+BOT_VERSION = "0.18.3"  # ← persist USER_ACTIVE_REPO across restarts
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -1832,6 +1854,7 @@ async def telegram_webhook(req: Request):
             target = SHORT_TO_REPO.get(arg.lower()) or (arg if arg in REPO_CONFIG else None)
             if target:
                 USER_ACTIVE_REPO[user_id] = target
+                _save_user_active_repo()
                 tg_send_message(chat_id, f"Репо: {target} ({_repo_short(target)})", reply_to_message_id=message_id)
             else:
                 available = ", ".join(f"/{cfg['short']}" for cfg in REPO_CONFIG.values()) or "(нет)"
