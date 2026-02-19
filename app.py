@@ -105,9 +105,9 @@ APPROVAL_REQUESTS: Dict[str, Any] = {}
 APPROVAL_AWAITING_FEEDBACK: Dict[int, Dict[str, str]] = {}
 
 # Default ticket options
-DEFAULT_OPTIONS = {"multi_agent": False, "testing": False, "approve_plan": False, "implementer": "opus", "large_profile": False}
+DEFAULT_OPTIONS = {"multi_agent": False, "testing": False, "approve_plan": False}
 
-# Labels for ticket options (boolean options only — implementer handled separately)
+# Labels for ticket options
 OPTION_LABELS = {
     "multi_agent": "ci:multi-agent",
     "testing": "ci:testing",
@@ -588,13 +588,9 @@ def confirmation_text(state: Dict[str, Any]) -> str:
 
     # Option toggles display
     opt_parts = []
-    impl_model = opts.get('implementer', 'opus')
-    opt_parts.append(f"{'🧠 Opus' if impl_model == 'opus' else '⚡ Codex'} пишет")
     opt_parts.append(f"{'✅' if opts.get('multi_agent') else '—'} мультиагент")
     opt_parts.append(f"{'✅' if opts.get('testing') else '—'} тесты")
     opt_parts.append(f"{'✅' if opts.get('approve_plan') else '—'} апрув плана")
-    if opts.get('implementer') == 'codex':
-        opt_parts.append(f"{'✅' if opts.get('large_profile') else '—'} large")
 
     return (
         "Вот что я распознал:\n\n"
@@ -607,25 +603,15 @@ def confirmation_text(state: Dict[str, Any]) -> str:
 
 def confirmation_keyboard(author_id: int, state: Dict[str, Any]) -> List[List[Dict[str, str]]]:
     opts = state.get("options", DEFAULT_OPTIONS)
-    impl_model = opts.get('implementer', 'opus')
-    impl_btn = f"{'🧠' if impl_model == 'opus' else '⚡'} {impl_model.capitalize()} → код"
     rows = [
         [{"text": "✅ Создать issue", "callback_data": f"create:{author_id}"}],
         [
-            {"text": impl_btn, "callback_data": f"opt_impl:{author_id}"},
             {"text": f"{'🤖' if opts.get('multi_agent') else '⬜'} Мультиагент", "callback_data": f"opt_ma:{author_id}"},
-        ],
-        [
             {"text": f"{'🧪' if opts.get('testing') else '⬜'} Тесты", "callback_data": f"opt_test:{author_id}"},
             {"text": f"{'📋' if opts.get('approve_plan') else '⬜'} Апрув", "callback_data": f"opt_appr:{author_id}"},
         ],
     ]
-    # Show large profile toggle only when Codex is the implementer
-    if impl_model == 'codex':
-        rows.append([
-            {"text": f"{'📦' if opts.get('large_profile') else '⬜'} Large профиль", "callback_data": f"opt_large:{author_id}"},
-        ])
-    rows.append([{"text": "✏️ Правка текста", "callback_data": f"edit:{author_id}"}, {"text": "📎 Скриншот", "callback_data": f"shot:{author_id}"}])
+    rows.append([{"text": "✏️ Правка текста", "callback_data": f"edit:{author_id}"}, {"text": "📎 скриншот", "callback_data": f"shot:{author_id}"}])
     rows.append([{"text": "❌ Отмена", "callback_data": f"cancel:{author_id}"}])
     return rows
 
@@ -805,12 +791,8 @@ async def github_notify(req: Request):
         if branch in CI_PROGRESS and options:
             CI_PROGRESS[branch]["options"] = options
 
-        codex_impl = options.get("codex_impl") == "true"
-        impl_name = "Codex" if codex_impl else "Claude"
-        impl_emoji = "⚡" if codex_impl else "🤖"
-
         tg_send_html(chat_id,
-            f"{impl_emoji} {impl_name} начал работу\n\n"
+            f"🤖 Claude начал работу\n\n"
             f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}\n"
             f"Ветка: {safe_branch}")
     elif event == "phase":
@@ -1334,17 +1316,11 @@ async def telegram_webhook(req: Request):
             return {"ok": True}
 
         # Toggle ticket options (re-render confirmation in-place)
-        if action in ("opt_ma", "opt_test", "opt_appr", "opt_impl", "opt_large"):
+        if action in ("opt_ma", "opt_test", "opt_appr"):
             opts = state.get("options", dict(DEFAULT_OPTIONS))
-            if action == "opt_impl":
-                # Toggle between "opus" and "codex"
-                opts["implementer"] = "codex" if opts.get("implementer", "opus") == "opus" else "opus"
-            elif action == "opt_large":
-                opts["large_profile"] = not opts.get("large_profile", False)
-            else:
-                toggle_map = {"opt_ma": "multi_agent", "opt_test": "testing", "opt_appr": "approve_plan"}
-                opt_key = toggle_map[action]
-                opts[opt_key] = not opts.get(opt_key, False)
+            toggle_map = {"opt_ma": "multi_agent", "opt_test": "testing", "opt_appr": "approve_plan"}
+            opt_key = toggle_map[action]
+            opts[opt_key] = not opts.get(opt_key, False)
             state["options"] = opts
 
             # Edit existing message with updated text and keyboard
@@ -1383,12 +1359,6 @@ async def telegram_webhook(req: Request):
                 for opt_key, label_name in OPTION_LABELS.items():
                     if opts.get(opt_key):
                         extra_labels.append(label_name)
-                # Add implementer label (only when codex — opus is default)
-                if opts.get("implementer") == "codex":
-                    extra_labels.append("ci:codex-impl")
-                # Add large profile label (only when codex + large)
-                if opts.get("large_profile"):
-                    extra_labels.append("ci:large")
 
                 if dev_info:
                     branch = dev_info["branch"]
@@ -1501,7 +1471,7 @@ async def telegram_webhook(req: Request):
                     if remaining > 0:
                         queue_info = f"\n\n📋 В очереди: {remaining}"
                 
-                impl_name = "Codex" if opts.get("implementer") == "codex" else "Claude"
+                impl_name = "Claude"
                 tg_send_message(chat_id,
                     f"📋 Тикет создан!\n\n"
                     f"#{issue_number} ({from_user.get('first_name', '')}): {issue_fmt['title']}\n"
@@ -1702,18 +1672,13 @@ async def telegram_webhook(req: Request):
                 multi = opts.get("multi_agent") == "true"
                 testing = opts.get("testing") == "true"
                 approve = opts.get("approve") == "true"
-                codex_impl = opts.get("codex_impl") == "true"
-
-                impl_name = "Codex" if codex_impl else "Opus"
-                reviewer_name = "Opus" if codex_impl else "Codex"
-
                 # Define all possible workflow steps
                 all_steps = [
-                    ("1", f"Планирование ({impl_name})", True),
-                    ("2", f"{reviewer_name} ревью", multi),
+                    ("1", "Планирование (Opus)", True),
+                    ("2", "Codex ревью", multi),
                     ("A", "Апрув плана", approve),
-                    ("3", f"Реализация ({impl_name})", True),
-                    ("4", f"{reviewer_name} код ревью", multi),
+                    ("3", "Реализация (Opus)", True),
+                    ("4", "Codex код ревью", multi),
                     ("5", "Тестирование", testing),
                     ("6", "Финализация", True),
                 ]
