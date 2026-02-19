@@ -727,8 +727,11 @@ def confirmation_text(state: Dict[str, Any]) -> str:
     screenshot = state.get("screenshot")
     dev_info = state.get("dev_info")
     opts = state.get("options", DEFAULT_OPTIONS)
+    repo = state.get("repo")
 
     meta = []
+    if repo:
+        meta.append(f"Репо: {_repo_short(repo)}")
     meta.append(f"Скриншот: {'✅ есть' if screenshot else '— нет'}")
     if dev_info:
         meta.append(f"Ветка: {dev_info['branch']}")
@@ -2015,6 +2018,7 @@ async def telegram_webhook(req: Request):
                 "screenshot": None,
                 "dev_info": dev_info,
                 "options": dict(DEFAULT_OPTIONS),
+                "repo": resolve_repo(chat_id, user_id),
             }
             show_confirmation(chat_id, user_id, PENDING[key], reply_to_message_id=message_id)
             return {"ok": True}
@@ -2044,6 +2048,7 @@ async def telegram_webhook(req: Request):
                 "screenshot": None,
                 "dev_info": dev_info,
                 "options": dict(DEFAULT_OPTIONS),
+                "repo": resolve_repo(chat_id, user_id),
             }
             show_confirmation(chat_id, user_id, PENDING[key], reply_to_message_id=message_id)
             return {"ok": True}
@@ -2100,6 +2105,7 @@ async def telegram_webhook(req: Request):
             "screenshot": None,
             "dev_info": dev_info,
             "options": dict(DEFAULT_OPTIONS),
+            "repo": resolve_repo(chat_id, user_id),
         }
         show_confirmation(chat_id, user_id, PENDING[key], reply_to_message_id=message_id)
         return {"ok": True}
