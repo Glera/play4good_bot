@@ -189,7 +189,7 @@ def _repo_short(repo: str) -> str:
 
 
 # Debug / versioning
-BOT_VERSION = "0.18.1"  # ← suppress deploy after /reset
+BOT_VERSION = "0.18.2"  # ← fix duplicate merged + post-completion deploy noise
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -213,6 +213,10 @@ LAST_DEPLOY_URL: Dict[str, str] = {}  # branch → ssl_url
 # Recently merged branches — catch Netlify deploy that arrives after CI finishes
 # branch → {"chat_id": int, "message_id": int, "text": str, "ts": float}
 RECENTLY_MERGED: Dict[str, Dict[str, Any]] = {}
+
+# Grace period after task completion — suppress standalone deploy notifications
+# ctx → timestamp (set when "merged" fires, any deploy within 90s is silently ignored)
+RECENTLY_COMPLETED: Dict[str, float] = {}
 
 # CI progress tracking per branch (for /status command)
 # {"started_at": int, "last_phase": str, "last_message": str, "last_update_at": int}
@@ -1063,6 +1067,15 @@ async def github_notify(req: Request):
         queue_clear_active(repo, branch)
         queue_process_next(repo, branch)
     elif event == "merged":
+        # Deduplicate: if already completed within 30s, skip duplicate "merged" event
+        prev_completed = RECENTLY_COMPLETED.get(ctx, 0)
+        if prev_completed and (time.time() - prev_completed) < 30:
+            print(f"[GH_NOTIFY] Duplicate merged for {ctx}, skipping (prev {time.time() - prev_completed:.0f}s ago)")
+            return {"ok": True, "skipped": "duplicate_merged"}
+
+        # Mark as recently completed (grace period for post-merge Netlify deploys)
+        RECENTLY_COMPLETED[ctx] = time.time()
+
         # Include saved deploy URL if available
         deploy_url = LAST_DEPLOY_URL.pop(ctx, "")
         deploy_line = f"\n\n🔗 <a href=\"{deploy_url}\">Открыть билд</a>" if deploy_url else ""
@@ -1362,6 +1375,11 @@ async def netlify_webhook(req: Request):
             print(f"[NETLIFY] Skipping deploy notification for DEVLOG/cherry-pick update: {commit_msg}")
             return {"ok": True, "skipped": "devlog update"}
 
+        # Skip deploy notifications for CI infrastructure commits (branch context sync)
+        if commit_msg and commit_msg.startswith("chore: update branch context"):
+            print(f"[NETLIFY] Skipping deploy notification for branch context update: {commit_msg}")
+            return {"ok": True, "skipped": "branch context update"}
+
         # Check if this is a deploy from branch just created/reset from main — save URL silently
         created_at = BRANCH_JUST_CREATED.pop(ctx, 0)
         if created_at and (time.time() - created_at) < 120:
@@ -1382,6 +1400,13 @@ async def netlify_webhook(req: Request):
             )
             print(f"[NETLIFY] Edited merged message for {branch} with deploy URL")
             return {"ok": True, "edited_merged": True}
+
+        # Grace period: suppress standalone deploy notifications shortly after task completion
+        # (handles multiple Netlify deploys arriving after merge — e.g. merge commit, infra commits)
+        completed_at = RECENTLY_COMPLETED.get(ctx, 0)
+        if completed_at and (time.time() - completed_at) < 90:
+            print(f"[NETLIFY] Task recently completed on {ctx} ({time.time() - completed_at:.0f}s ago) — suppressing standalone deploy")
+            return {"ok": True, "skipped": "recently_completed"}
 
         app_url = _netlify_app_url(ssl_url, site_name)
         text = f"✅ Деплой готов! {mention}, можно тестировать"
