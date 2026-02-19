@@ -147,6 +147,18 @@ def _netlify_app_url(ssl_url: str, site_name: str) -> str:
     if app_path and ssl_url:
         return ssl_url.rstrip("/") + "/" + app_path.strip("/") + "/"
     return ssl_url
+
+# Reverse lookup: repo → site_name (for constructing URLs without Netlify webhook)
+_REPO_TO_SITE: Dict[str, str] = {repo: site for site, repo in NETLIFY_SITE_MAP.items()}
+
+def _construct_deploy_url(repo: str) -> str:
+    """Construct expected Netlify deploy URL from NETLIFY_SITE_MAP (no webhook needed)."""
+    site = _REPO_TO_SITE.get(repo, "")
+    if not site:
+        return ""
+    base_url = f"https://{site}.netlify.app"
+    return _netlify_app_url(base_url, site)
+
 SHORT_TO_REPO: Dict[str, str] = {cfg["short"]: name for name, cfg in REPO_CONFIG.items()}
 
 # If no multi-repo config, register single GITHUB_REPO as fallback
@@ -211,7 +223,7 @@ def _repo_short(repo: str) -> str:
 
 
 # Debug / versioning
-BOT_VERSION = "0.18.3"  # ← persist USER_ACTIVE_REPO across restarts
+BOT_VERSION = "0.19.0"  # ← always include deploy URL in "Задача завершена" (construct from NETLIFY_SITE_MAP)
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -1098,8 +1110,8 @@ async def github_notify(req: Request):
         # Mark as recently completed (grace period for post-merge Netlify deploys)
         RECENTLY_COMPLETED[ctx] = time.time()
 
-        # Include saved deploy URL if available
-        deploy_url = LAST_DEPLOY_URL.pop(ctx, "")
+        # Include deploy URL: saved from Netlify webhook, or construct from NETLIFY_SITE_MAP
+        deploy_url = LAST_DEPLOY_URL.pop(ctx, "") or _construct_deploy_url(repo)
         deploy_line = f"\n\n🔗 <a href=\"{deploy_url}\">Открыть билд</a>" if deploy_url else ""
 
         text = (
