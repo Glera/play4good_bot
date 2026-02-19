@@ -898,7 +898,7 @@ def queue_process_next(repo: str, branch: str) -> Optional[Dict[str, Any]]:
         if dev_ctx:
             remaining = len(pending) - 1
             queue_info = f"\n📋 В очереди ещё: {remaining}" if remaining > 0 else ""
-            repo_tag = f" [{_repo_short(repo)}]" if len(REPO_CONFIG) > 1 else ""
+            repo_tag = f" [{_repo_short(repo)}]"
             tg_send_html(dev_ctx["chat_id"],
                 f"▶️ Следующий тикет{repo_tag}: <a href=\"{issue['html_url']}\">#{issue_number}</a>\n"
                 f"{html_escape(issue_title)}{queue_info}")
@@ -952,8 +952,7 @@ async def github_notify(req: Request):
 
     chat_id = dev_ctx["chat_id"]
     mention = tg_mention(dev_ctx["user_id"], dev_ctx["first_name"])
-    repo_tag = f" [{_repo_short(repo)}]" if len(REPO_CONFIG) > 1 else ""
-
+    repo_tag = f" [{_repo_short(repo)}]" 
     safe_title = html_escape(issue_title)
     safe_branch = html_escape(branch)
 
@@ -1641,7 +1640,7 @@ async def telegram_webhook(req: Request):
                     updated_body = issue_body + "\n\n---\n" + (branch_info + screenshot_info).strip()
                     gh_update_issue(issue_number, updated_body, repo=target_repo)
 
-                repo_tag = f" [{_repo_short(target_repo)}]" if len(REPO_CONFIG) > 1 else ""
+                repo_tag = f" [{_repo_short(target_repo)}]"
 
                 if is_busy:
                     # Issue created with queue:pending — notify about queue position
@@ -1707,7 +1706,7 @@ async def telegram_webhook(req: Request):
     # Help
     cmd_base = text.lower().split("@")[0]
     if cmd_base in ("/start", "/help", "help"):
-        repo_cmd = "\n/repo — выбрать репозиторий" if len(REPO_CONFIG) > 1 else ""
+        repo_cmd = "\n/repo — выбрать репозиторий"
         if in_group and REQUIRE_TICKET_COMMAND:
             tg_send_message(chat_id, f"В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/status — статус текущего тикета\n/queue — очередь тикетов\n/apps — открыть приложения\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку{repo_cmd}", reply_to_message_id=message_id)
         else:
@@ -1799,7 +1798,7 @@ async def telegram_webhook(req: Request):
         branch = dev_info["branch"]
         reset_repo = resolve_repo(chat_id, user_id)
         default_br = _default_branch(reset_repo)
-        repo_tag = f" [{_repo_short(reset_repo)}]" if len(REPO_CONFIG) > 1 else ""
+        repo_tag = f" [{_repo_short(reset_repo)}]"
         keyboard = [
             [{"text": f"⚠️ Да, перезатереть {branch}", "callback_data": f"reset_confirm:{user_id}"}],
             [{"text": "Отмена", "callback_data": f"reset_cancel:{user_id}"}],
@@ -1826,8 +1825,7 @@ async def telegram_webhook(req: Request):
         active = ACTIVE_TICKET.get(ctx)
         pending_count = queue_size(clear_repo, branch)
 
-        repo_tag = f" [{_repo_short(clear_repo)}]" if len(REPO_CONFIG) > 1 else ""
-
+        repo_tag = f" [{_repo_short(clear_repo)}]" 
         if not active and pending_count == 0:
             tg_send_message(chat_id, f"Очередь{repo_tag} {branch} уже пуста, нечего очищать.", reply_to_message_id=message_id)
             return {"ok": True}
@@ -1863,7 +1861,7 @@ async def telegram_webhook(req: Request):
         branch = dev_info["branch"]
         q_repo = resolve_repo(chat_id, user_id)
         ctx = _ctx_key(q_repo, branch)
-        repo_tag = f" [{_repo_short(q_repo)}]" if len(REPO_CONFIG) > 1 else ""
+        repo_tag = f" [{_repo_short(q_repo)}]"
         # Check active (in-memory + GitHub fallback)
         queue_is_busy(q_repo, branch)  # triggers recovery if needed
         active = ACTIVE_TICKET.get(ctx)
@@ -1897,7 +1895,7 @@ async def telegram_webhook(req: Request):
         branch = dev_info["branch"]
         s_repo = resolve_repo(chat_id, user_id)
         ctx = _ctx_key(s_repo, branch)
-        repo_tag = f" [{_repo_short(s_repo)}]" if len(REPO_CONFIG) > 1 else ""
+        repo_tag = f" [{_repo_short(s_repo)}]"
         queue_is_busy(s_repo, branch)  # triggers recovery from GitHub if needed after bot restart
         active = ACTIVE_TICKET.get(ctx)
         progress = CI_PROGRESS.get(ctx)
