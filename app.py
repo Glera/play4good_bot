@@ -67,7 +67,7 @@ DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 _BRANCH_TO_DEV: Dict[str, int] = {info["branch"]: uid for uid, info in DEVELOPER_MAP.items()}
 
 # Debug / versioning
-BOT_VERSION = "0.13.2"  # ← fix deploy URL when CI active + DEVLOG commit
+BOT_VERSION = "0.14.0"  # ← add ci:large profile toggle
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -105,7 +105,7 @@ APPROVAL_REQUESTS: Dict[str, Any] = {}
 APPROVAL_AWAITING_FEEDBACK: Dict[int, Dict[str, str]] = {}
 
 # Default ticket options
-DEFAULT_OPTIONS = {"multi_agent": False, "testing": False, "approve_plan": False, "implementer": "opus"}
+DEFAULT_OPTIONS = {"multi_agent": False, "testing": False, "approve_plan": False, "implementer": "opus", "large_profile": False}
 
 # Labels for ticket options (boolean options only — implementer handled separately)
 OPTION_LABELS = {
@@ -593,6 +593,8 @@ def confirmation_text(state: Dict[str, Any]) -> str:
     opt_parts.append(f"{'✅' if opts.get('multi_agent') else '—'} мультиагент")
     opt_parts.append(f"{'✅' if opts.get('testing') else '—'} тесты")
     opt_parts.append(f"{'✅' if opts.get('approve_plan') else '—'} апрув плана")
+    if opts.get('implementer') == 'codex':
+        opt_parts.append(f"{'✅' if opts.get('large_profile') else '—'} large")
 
     return (
         "Вот что я распознал:\n\n"
@@ -607,7 +609,7 @@ def confirmation_keyboard(author_id: int, state: Dict[str, Any]) -> List[List[Di
     opts = state.get("options", DEFAULT_OPTIONS)
     impl_model = opts.get('implementer', 'opus')
     impl_btn = f"{'🧠' if impl_model == 'opus' else '⚡'} {impl_model.capitalize()} → код"
-    return [
+    rows = [
         [{"text": "✅ Создать issue", "callback_data": f"create:{author_id}"}],
         [
             {"text": impl_btn, "callback_data": f"opt_impl:{author_id}"},
@@ -617,9 +619,15 @@ def confirmation_keyboard(author_id: int, state: Dict[str, Any]) -> List[List[Di
             {"text": f"{'🧪' if opts.get('testing') else '⬜'} Тесты", "callback_data": f"opt_test:{author_id}"},
             {"text": f"{'📋' if opts.get('approve_plan') else '⬜'} Апрув", "callback_data": f"opt_appr:{author_id}"},
         ],
-        [{"text": "✏️ Правка текста", "callback_data": f"edit:{author_id}"}, {"text": "📎 Скриншот", "callback_data": f"shot:{author_id}"}],
-        [{"text": "❌ Отмена", "callback_data": f"cancel:{author_id}"}],
     ]
+    # Show large profile toggle only when Codex is the implementer
+    if impl_model == 'codex':
+        rows.append([
+            {"text": f"{'📦' if opts.get('large_profile') else '⬜'} Large профиль", "callback_data": f"opt_large:{author_id}"},
+        ])
+    rows.append([{"text": "✏️ Правка текста", "callback_data": f"edit:{author_id}"}, {"text": "📎 Скриншот", "callback_data": f"shot:{author_id}"}])
+    rows.append([{"text": "❌ Отмена", "callback_data": f"cancel:{author_id}"}])
+    return rows
 
 
 def show_confirmation(chat_id: int, author_id: int, state: Dict[str, Any], reply_to_message_id: Optional[int] = None) -> None:
@@ -1316,11 +1324,13 @@ async def telegram_webhook(req: Request):
             return {"ok": True}
 
         # Toggle ticket options (re-render confirmation in-place)
-        if action in ("opt_ma", "opt_test", "opt_appr", "opt_impl"):
+        if action in ("opt_ma", "opt_test", "opt_appr", "opt_impl", "opt_large"):
             opts = state.get("options", dict(DEFAULT_OPTIONS))
             if action == "opt_impl":
                 # Toggle between "opus" and "codex"
                 opts["implementer"] = "codex" if opts.get("implementer", "opus") == "opus" else "opus"
+            elif action == "opt_large":
+                opts["large_profile"] = not opts.get("large_profile", False)
             else:
                 toggle_map = {"opt_ma": "multi_agent", "opt_test": "testing", "opt_appr": "approve_plan"}
                 opt_key = toggle_map[action]
@@ -1366,6 +1376,9 @@ async def telegram_webhook(req: Request):
                 # Add implementer label (only when codex — opus is default)
                 if opts.get("implementer") == "codex":
                     extra_labels.append("ci:codex-impl")
+                # Add large profile label (only when codex + large)
+                if opts.get("large_profile"):
+                    extra_labels.append("ci:large")
 
                 if dev_info:
                     branch = dev_info["branch"]
