@@ -223,7 +223,7 @@ def _repo_short(repo: str) -> str:
 
 
 # Debug / versioning
-BOT_VERSION = "0.19.0"  # ← always include deploy URL in "Задача завершена" (construct from NETLIFY_SITE_MAP)
+BOT_VERSION = "0.19.1"  # ← show version hint in deploy link
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -1112,7 +1112,9 @@ async def github_notify(req: Request):
 
         # Include deploy URL: saved from Netlify webhook, or construct from NETLIFY_SITE_MAP
         deploy_url = LAST_DEPLOY_URL.pop(ctx, "") or _construct_deploy_url(repo)
-        deploy_line = f"\n\n🔗 <a href=\"{deploy_url}\">Открыть билд</a>" if deploy_url else ""
+        version = payload.get("version", "")
+        version_hint = f" (v{version})" if version else ""
+        deploy_line = f"\n\n🔗 <a href=\"{deploy_url}\">Открыть билд{version_hint}</a>" if deploy_url else ""
 
         text = (
             f"📦 Задача завершена{repo_tag} — {safe_branch}\n\n"
