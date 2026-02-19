@@ -23,6 +23,8 @@ GITHUB_LABELS = os.environ.get("GITHUB_LABELS", "")
 # CHAT_REPO_MAP="-100xxxx:owner/repo1,-100yyyy:owner/repo2"
 _GITHUB_REPOS_RAW = os.environ.get("GITHUB_REPOS", "")
 _CHAT_REPO_MAP_RAW = os.environ.get("CHAT_REPO_MAP", "")
+# NETLIFY_SITE_MAP="site-name-1:owner/repo1,site-name-2:owner/repo2"
+_NETLIFY_SITE_MAP_RAW = os.environ.get("NETLIFY_SITE_MAP", "")
 
 # In groups: require /ticket to avoid noise (recommended)
 REQUIRE_TICKET_COMMAND = os.environ.get("REQUIRE_TICKET_COMMAND", "true").lower() in ("1", "true", "yes", "y")
@@ -108,6 +110,22 @@ def _parse_chat_repo_map(raw: str) -> Dict[int, str]:
 
 REPO_CONFIG: Dict[str, Dict[str, str]] = _parse_repos(_GITHUB_REPOS_RAW)
 CHAT_TO_REPO: Dict[int, str] = _parse_chat_repo_map(_CHAT_REPO_MAP_RAW)
+
+def _parse_netlify_site_map(raw: str) -> Dict[str, str]:
+    """Parse NETLIFY_SITE_MAP env: 'site-name:owner/repo,...' → {site_name: full_repo}"""
+    result: Dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":", 1)
+        if len(parts) < 2:
+            print(f"[WARN] Invalid NETLIFY_SITE_MAP entry: {entry!r} (expected site:owner/repo)")
+            continue
+        result[parts[0].strip()] = parts[1].strip()
+    return result
+
+NETLIFY_SITE_MAP: Dict[str, str] = _parse_netlify_site_map(_NETLIFY_SITE_MAP_RAW)
 SHORT_TO_REPO: Dict[str, str] = {cfg["short"]: name for name, cfg in REPO_CONFIG.items()}
 
 # If no multi-repo config, register single GITHUB_REPO as fallback
@@ -151,7 +169,7 @@ def _repo_short(repo: str) -> str:
 
 
 # Debug / versioning
-BOT_VERSION = "0.17.0"  # ← multi-repo support
+BOT_VERSION = "0.17.1"  # ← Netlify site→repo mapping
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -211,6 +229,7 @@ print(f"[BOT] GITHUB_REPO={GITHUB_REPO} REQUIRE_TICKET_CMD={REQUIRE_TICKET_COMMA
 print(f"[BOT] REPO_CONFIG={REPO_CONFIG}")
 print(f"[BOT] CHAT_TO_REPO={CHAT_TO_REPO}")
 print(f"[BOT] SHORT_TO_REPO={SHORT_TO_REPO}")
+print(f"[BOT] NETLIFY_SITE_MAP={NETLIFY_SITE_MAP}")
 print(f"[BOT] WEBAPP_PROD={WEBAPP_URL_PRODUCTION or '(empty)'}")
 print(f"[BOT] WEBAPP_DEV1={WEBAPP_URL_DEV_1 or '(empty)'} ({WEBAPP_DEV_1_NAME})")
 print(f"[BOT] WEBAPP_DEV2={WEBAPP_URL_DEV_2 or '(empty)'} ({WEBAPP_DEV_2_NAME})")
@@ -1253,8 +1272,8 @@ async def netlify_webhook(req: Request):
 
     state = payload.get("state", "")
     branch = payload.get("branch", "")
-    repo = payload.get("repo") or GITHUB_REPO
     site_name = payload.get("name", "")
+    repo = payload.get("repo") or NETLIFY_SITE_MAP.get(site_name) or GITHUB_REPO
     ssl_url = payload.get("ssl_url", "")
     error_message = payload.get("error_message", "")
     commit_msg = payload.get("title", "")
