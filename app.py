@@ -67,7 +67,7 @@ DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 _BRANCH_TO_DEV: Dict[str, int] = {info["branch"]: uid for uid, info in DEVELOPER_MAP.items()}
 
 # Debug / versioning
-BOT_VERSION = "0.13.0"  # ← implementer model selection (opus/codex)
+BOT_VERSION = "0.13.1"  # ← fix model name in notifications
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -797,8 +797,12 @@ async def github_notify(req: Request):
         if branch in CI_PROGRESS and options:
             CI_PROGRESS[branch]["options"] = options
 
+        codex_impl = options.get("codex_impl") == "true"
+        impl_name = "Codex" if codex_impl else "Claude"
+        impl_emoji = "⚡" if codex_impl else "🤖"
+
         tg_send_html(chat_id,
-            f"🤖 Claude начал работу\n\n"
+            f"{impl_emoji} {impl_name} начал работу\n\n"
             f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}\n"
             f"Ветка: {safe_branch}")
     elif event == "phase":
@@ -1473,11 +1477,12 @@ async def telegram_webhook(req: Request):
                     if remaining > 0:
                         queue_info = f"\n\n📋 В очереди: {remaining}"
                 
+                impl_name = "Codex" if opts.get("implementer") == "codex" else "Claude"
                 tg_send_message(chat_id,
                     f"📋 Тикет создан!\n\n"
                     f"#{issue_number} ({from_user.get('first_name', '')}): {issue_fmt['title']}\n"
                     f"{issue_url}\n\n"
-                    f"Claude скоро возьмётся за работу...{queue_info}",
+                    f"{impl_name} скоро возьмётся за работу...{queue_info}",
                     reply_to_message_id=reply_to_id)
 
             except Exception as e:
