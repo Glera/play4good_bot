@@ -111,21 +111,41 @@ def _parse_chat_repo_map(raw: str) -> Dict[int, str]:
 REPO_CONFIG: Dict[str, Dict[str, str]] = _parse_repos(_GITHUB_REPOS_RAW)
 CHAT_TO_REPO: Dict[int, str] = _parse_chat_repo_map(_CHAT_REPO_MAP_RAW)
 
-def _parse_netlify_site_map(raw: str) -> Dict[str, str]:
-    """Parse NETLIFY_SITE_MAP env: 'site-name:owner/repo,...' → {site_name: full_repo}"""
-    result: Dict[str, str] = {}
+def _parse_netlify_site_map(raw: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Parse NETLIFY_SITE_MAP env: 'site:owner/repo' or 'site:owner/repo:/path'.
+    Returns (site→repo, site→app_path) dicts."""
+    repo_map: Dict[str, str] = {}
+    path_map: Dict[str, str] = {}
     for entry in raw.split(","):
         entry = entry.strip()
         if not entry:
             continue
+        # Split into at most 3 parts: site-name : owner/repo : /path
         parts = entry.split(":", 1)
         if len(parts) < 2:
             print(f"[WARN] Invalid NETLIFY_SITE_MAP entry: {entry!r} (expected site:owner/repo)")
             continue
-        result[parts[0].strip()] = parts[1].strip()
-    return result
+        site_name = parts[0].strip()
+        rest = parts[1].strip()
+        # Check for optional path (starts with /)
+        # Format: "owner/repo:/playground/" — split on last ":"
+        if ":/" in rest:
+            repo_part, path_part = rest.rsplit(":", 1)
+            repo_map[site_name] = repo_part.strip()
+            path_map[site_name] = path_part.strip()
+        else:
+            repo_map[site_name] = rest
+    return repo_map, path_map
 
-NETLIFY_SITE_MAP: Dict[str, str] = _parse_netlify_site_map(_NETLIFY_SITE_MAP_RAW)
+NETLIFY_SITE_MAP, NETLIFY_APP_PATHS = _parse_netlify_site_map(_NETLIFY_SITE_MAP_RAW)
+
+
+def _netlify_app_url(ssl_url: str, site_name: str) -> str:
+    """Append playground path to Netlify URL if configured in NETLIFY_SITE_MAP."""
+    app_path = NETLIFY_APP_PATHS.get(site_name, "")
+    if app_path and ssl_url:
+        return ssl_url.rstrip("/") + "/" + app_path.strip("/") + "/"
+    return ssl_url
 SHORT_TO_REPO: Dict[str, str] = {cfg["short"]: name for name, cfg in REPO_CONFIG.items()}
 
 # If no multi-repo config, register single GITHUB_REPO as fallback
@@ -169,7 +189,7 @@ def _repo_short(repo: str) -> str:
 
 
 # Debug / versioning
-BOT_VERSION = "0.17.1"  # ← Netlify site→repo mapping
+BOT_VERSION = "0.18.0"  # ← /help, /apps multi-repo, playground URLs, repo fix
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -710,27 +730,42 @@ def format_issue(text: str, chat_id: int, user: dict, dev_info: Optional[Dict[st
 
 # ===================== UI / FLOW =====================
 def show_apps_menu(chat_id: int, reply_to_message_id: Optional[int] = None, in_group: bool = False) -> None:
-    """Send keyboard with WebApp buttons. In groups use ReplyKeyboard, in DM use InlineKeyboard."""
+    """Send keyboard with WebApp buttons for all Netlify sites. Falls back to legacy WEBAPP_URL_DEV_* env vars."""
     print(f"[APPS] show_apps_menu called for chat={chat_id} in_group={in_group}")
 
-    if not WEBAPP_URL_DEV_1 and not WEBAPP_URL_DEV_2:
-        print("[APPS] No dev URLs configured — sending error message")
-        tg_send_message(chat_id, "Dev URLs не настроены. Задайте WEBAPP_URL_DEV_* в env.", reply_to_message_id=reply_to_message_id)
-        return
-
     if in_group:
-        # web_app buttons don't work in groups (Telegram limitation)
         tg_send_message(chat_id,
-            "WebApp кнопки работают только в личке. Напиши мне /apps в личные сообщения 👉 @play4good_bot",
+            "WebApp кнопки работают только в личке. Напиши мне /apps в личные сообщения.",
             reply_to_message_id=reply_to_message_id)
         return
 
-    # In DM: use InlineKeyboardMarkup with web_app
     keyboard_inline: List[List[Dict[str, Any]]] = []
-    if WEBAPP_URL_DEV_1:
-        keyboard_inline.append([{"text": f"\U0001f535 Тест — {WEBAPP_DEV_1_NAME}", "web_app": {"url": WEBAPP_URL_DEV_1}}])
-    if WEBAPP_URL_DEV_2:
-        keyboard_inline.append([{"text": f"\U0001f7e1 Тест — {WEBAPP_DEV_2_NAME}", "web_app": {"url": WEBAPP_URL_DEV_2}}])
+
+    # Build from NETLIFY_SITE_MAP (primary source)
+    if NETLIFY_SITE_MAP:
+        # Group sites by repo
+        repo_sites: Dict[str, List[str]] = {}
+        for site_name, repo in NETLIFY_SITE_MAP.items():
+            repo_sites.setdefault(repo, []).append(site_name)
+
+        for repo, sites in repo_sites.items():
+            short = _repo_short(repo)
+            for site_name in sites:
+                base_url = f"https://{site_name}.netlify.app"
+                url = _netlify_app_url(base_url, site_name)
+                label = f"🔗 {short} — {site_name}"
+                keyboard_inline.append([{"text": label, "web_app": {"url": url}}])
+
+    # Legacy fallback: WEBAPP_URL_DEV_* env vars
+    if not keyboard_inline:
+        if WEBAPP_URL_DEV_1:
+            keyboard_inline.append([{"text": f"🔵 Тест — {WEBAPP_DEV_1_NAME}", "web_app": {"url": WEBAPP_URL_DEV_1}}])
+        if WEBAPP_URL_DEV_2:
+            keyboard_inline.append([{"text": f"🟡 Тест — {WEBAPP_DEV_2_NAME}", "web_app": {"url": WEBAPP_URL_DEV_2}}])
+
+    if not keyboard_inline:
+        tg_send_message(chat_id, "Приложения не настроены. Задайте NETLIFY_SITE_MAP в env.", reply_to_message_id=reply_to_message_id)
+        return
 
     print(f"[APPS] Sending InlineKeyboard with {len(keyboard_inline)} buttons")
     resp = tg_send_message_with_keyboard(
@@ -1306,7 +1341,7 @@ async def netlify_webhook(req: Request):
         # Must be checked FIRST: DEVLOG/screenshot/merge commits still produce valid deploys
         # and the URL should be included in the final "done" notification
         if queue_is_busy(repo, branch):
-            LAST_DEPLOY_URL[ctx] = ssl_url
+            LAST_DEPLOY_URL[ctx] = _netlify_app_url(ssl_url, site_name)
             print(f"[NETLIFY] CI active on {ctx} — saved deploy URL (commit: {commit_msg})")
             return {"ok": True, "skipped": "ci_active", "deploy_url_saved": True}
 
@@ -1338,7 +1373,8 @@ async def netlify_webhook(req: Request):
         # If task just finished (merged), edit the "📦 Задача завершена" message to add deploy link
         merged_info = RECENTLY_MERGED.pop(ctx, None)
         if merged_info and (time.time() - merged_info["ts"]) < 180:
-            updated_text = merged_info["text"] + f"\n\n🔗 <a href=\"{ssl_url}\">Открыть билд</a>"
+            app_url = _netlify_app_url(ssl_url, site_name)
+            updated_text = merged_info["text"] + f"\n\n🔗 <a href=\"{app_url}\">Открыть билд</a>"
             pick_repo = merged_info.get("repo", repo)
             keyboard = [[{"text": "⭐ Забрать в main", "callback_data": f"pick:{pick_repo}:{merged_info['issue_number']}"}]]
             tg_edit_message_with_keyboard(
@@ -1348,12 +1384,13 @@ async def netlify_webhook(req: Request):
             print(f"[NETLIFY] Edited merged message for {branch} with deploy URL")
             return {"ok": True, "edited_merged": True}
 
+        app_url = _netlify_app_url(ssl_url, site_name)
         text = f"✅ Деплой готов! {mention}, можно тестировать"
         text += f"\n\nСайт: {safe_site}"
         text += f"\nВетка: {safe_branch}"
         if safe_commit:
             text += f"\nКоммит: {safe_commit}"
-        text += f"\n\n🔗 {ssl_url}"
+        text += f"\n\n🔗 {app_url}"
         tg_send_html(chat_id, text)
     elif state == "error":
         safe_error = html_escape(error_message) if error_message else ""
@@ -1581,7 +1618,8 @@ async def telegram_webhook(req: Request):
                 dev_info = DEVELOPER_MAP.get(clicker_id)
                 extra_labels: List[str] = []
                 branch = None
-                target_repo = resolve_repo(chat_id, clicker_id)
+                # Use repo stored in PENDING (captured at draft time) — survives bot restarts
+                target_repo = state.get("repo") or resolve_repo(chat_id, clicker_id)
 
                 if not target_repo:
                     tg_send_message(chat_id, "Выбери репозиторий: /repo", reply_to_message_id=reply_to_id)
@@ -1728,11 +1766,23 @@ async def telegram_webhook(req: Request):
     # Help
     cmd_base = text.lower().split("@")[0]
     if cmd_base in ("/start", "/help", "help"):
-        repo_cmd = "\n/repo — выбрать репозиторий"
+        help_lines = [
+            "📋 <b>Команды</b>\n",
+            "/ticket — создать тикет (голосовое или текст)",
+            "/status — статус текущего тикета и CI",
+            "/queue — очередь тикетов на ветке",
+            "/repo — выбрать активный репозиторий",
+            "/apps — открыть тестовые приложения",
+            "/clear — очистить застрявшую очередь",
+            "/reset — сбросить dev-ветку на main",
+            "/debug — отладочная информация бота",
+            "/help — эта справка",
+        ]
         if in_group and REQUIRE_TICKET_COMMAND:
-            tg_send_message(chat_id, f"В группе: /ticket (и потом голосовое в течение 120 сек) или /ticket <текст>.\n/status — статус текущего тикета\n/queue — очередь тикетов\n/apps — открыть приложения\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку{repo_cmd}", reply_to_message_id=message_id)
+            help_lines.insert(1, "<i>В группе: /ticket → голосовое (120 сек) или /ticket текст</i>\n")
         else:
-            tg_send_message(chat_id, f"Пришли голосовое (или /ticket <текст>) — я создам GitHub Issue.\n/status — статус текущего тикета\n/queue — очередь тикетов\n/apps — открыть приложения\n/clear — очистить застрявшую очередь\n/reset — сбросить dev-ветку{repo_cmd}", reply_to_message_id=message_id)
+            help_lines.insert(1, "<i>Пришли голосовое или /ticket текст — создам GitHub Issue</i>\n")
+        tg_send_html(chat_id, "\n".join(help_lines), reply_to_message_id=message_id)
         return {"ok": True}
 
     # Repo selection (multi-repo)
