@@ -167,8 +167,10 @@ if not REPO_CONFIG and GITHUB_REPO:
     SHORT_TO_REPO[GITHUB_REPO.split("/")[-1]] = GITHUB_REPO
 
 # Runtime: user → active repo (set by /repo command in personal chats)
-# Persisted to JSON file to survive bot restarts
-_USER_REPO_FILE = os.path.join(os.path.dirname(__file__), ".user_active_repo.json")
+# Persisted to JSON file to survive bot restarts/redeploys
+# Set PERSIST_DIR env to a Railway volume mount (e.g. /data) for persistence across deploys
+_PERSIST_DIR = os.environ.get("PERSIST_DIR", os.path.dirname(__file__))
+_USER_REPO_FILE = os.path.join(_PERSIST_DIR, ".user_active_repo.json")
 
 def _load_user_active_repo() -> Dict[int, str]:
     try:
@@ -223,7 +225,7 @@ def _repo_short(repo: str) -> str:
 
 
 # Debug / versioning
-BOT_VERSION = "0.19.2"  # ← fix merge filter for master branch
+BOT_VERSION = "0.19.3"  # ← PERSIST_DIR for Railway volume + master merge filter
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
