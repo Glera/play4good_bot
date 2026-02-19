@@ -67,7 +67,7 @@ DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 _BRANCH_TO_DEV: Dict[str, int] = {info["branch"]: uid for uid, info in DEVELOPER_MAP.items()}
 
 # Debug / versioning
-BOT_VERSION = "0.15.0"  # ← auto-backup before /reset
+BOT_VERSION = "0.16.0"  # ← persistent queue via GitHub Issues
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -78,11 +78,11 @@ DEV_CHAT: Dict[str, Dict[str, Any]] = {}  # e.g. {"dev/Gleb": {"chat_id": -10012
 # Track recently created branches to distinguish "created from main" deploys
 BRANCH_JUST_CREATED: Dict[str, float] = {}  # branch → timestamp
 
-# Ticket queue: branch → list of pending tickets
-# Each ticket: {"title": str, "body": str, "labels": list, "chat_id": int, "user_id": int, "first_name": str, "dev_info": dict}
-TICKET_QUEUE: Dict[str, List[Dict[str, Any]]] = {}
+# Ticket queue: persisted as GitHub Issues with queue:pending / queue:execute labels
+# TICKET_QUEUE dict removed — queue lives in GitHub Issues now
 
 # Currently executing ticket: branch → issue info (None if idle)
+# Recovered from GitHub Issues (queue:execute label) on bot restart
 ACTIVE_TICKET: Dict[str, Optional[Dict[str, Any]]] = {}  # {"issue_number": int, "title": str}
 
 # Last Netlify deploy URL per branch (saved when CI is active, included in final notification)
@@ -540,6 +540,43 @@ def gh_add_label(number: int, label: str) -> bool:
     return True
 
 
+def gh_remove_label(number: int, label: str) -> bool:
+    """Remove a label from an issue. Returns True on success."""
+    owner, repo = gh_repo_parts()
+    r = requests.delete(
+        f"{GH_API}/repos/{owner}/{repo}/issues/{number}/labels/{label}",
+        headers=gh_headers(),
+        timeout=30,
+    )
+    if r.status_code >= 300:
+        print(f"[GH] Remove label failed {r.status_code}: {r.text[:200]}")
+        return False
+    return True
+
+
+def gh_list_issues_with_labels(labels: List[str], state: str = "open", direction: str = "asc") -> List[Dict[str, Any]]:
+    """List issues with ALL specified labels. Returns oldest first by default."""
+    owner, repo = gh_repo_parts()
+    r = requests.get(
+        f"{GH_API}/repos/{owner}/{repo}/issues",
+        headers=gh_headers(),
+        params={"labels": ",".join(labels), "state": state, "sort": "created", "direction": direction, "per_page": 20},
+        timeout=30,
+    )
+    if r.status_code >= 300:
+        print(f"[GH] List issues failed {r.status_code}: {r.text[:200]}")
+        return []
+    return r.json()
+
+
+def _get_dev_label(branch: str) -> Optional[str]:
+    """Get developer label for a branch (e.g. 'dev/Gleb' -> 'developer:Gleb')."""
+    uid = _BRANCH_TO_DEV.get(branch)
+    if uid and uid in DEVELOPER_MAP:
+        return DEVELOPER_MAP[uid]["label"]
+    return None
+
+
 def format_issue(text: str, chat_id: int, user: dict, dev_info: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     clean = " ".join(text.split()).strip()
     title = clean
@@ -659,34 +696,58 @@ def extract_image_from_message(msg: dict) -> Optional[Dict[str, Any]]:
     return None
 
 
-# ===================== TICKET QUEUE =====================
-def queue_add_ticket(branch: str, ticket: Dict[str, Any]) -> int:
-    """Add ticket to queue. Returns queue position (1 = next, 0 = executing now)."""
-    if branch not in TICKET_QUEUE:
-        TICKET_QUEUE[branch] = []
-    TICKET_QUEUE[branch].append(ticket)
-    return len(TICKET_QUEUE[branch])
-
-
-def queue_get_next(branch: str) -> Optional[Dict[str, Any]]:
-    """Pop next ticket from queue. Returns None if empty."""
-    if branch not in TICKET_QUEUE or not TICKET_QUEUE[branch]:
-        return None
-    return TICKET_QUEUE[branch].pop(0)
-
-
-def queue_size(branch: str) -> int:
-    """Get queue size for branch."""
-    return len(TICKET_QUEUE.get(branch, []))
+# ===================== TICKET QUEUE (GitHub Issues) =====================
+# Queue is persisted as GitHub Issues with labels:
+#   queue:pending  — waiting in queue (CI ignores)
+#   queue:execute  — being processed (CI triggers on this label)
+# Bot controls execution order by swapping labels one at a time.
 
 
 def queue_is_busy(branch: str) -> bool:
-    """Check if branch has active ticket."""
-    return ACTIVE_TICKET.get(branch) is not None
+    """Check if branch has active ticket. In-memory with GitHub API fallback (handles bot restart)."""
+    if ACTIVE_TICKET.get(branch) is not None:
+        return True
+    # Fallback: check GitHub for issue with queue:execute label
+    dev_label = _get_dev_label(branch)
+    if not dev_label:
+        return False
+    try:
+        active_issues = gh_list_issues_with_labels(["queue:execute", dev_label])
+        if active_issues:
+            issue = active_issues[0]
+            queue_set_active(branch, issue["number"], issue["title"])
+            print(f"[QUEUE] Recovered active ticket from GitHub: #{issue['number']}")
+            return True
+    except Exception as e:
+        print(f"[QUEUE] GitHub fallback check failed: {e}")
+    return False
+
+
+def queue_size(branch: str) -> int:
+    """Get count of pending tickets for branch from GitHub Issues."""
+    dev_label = _get_dev_label(branch)
+    if not dev_label:
+        return 0
+    try:
+        pending = gh_list_issues_with_labels(["queue:pending", dev_label])
+        return len(pending)
+    except Exception:
+        return 0
+
+
+def queue_list_pending(branch: str) -> List[Dict[str, Any]]:
+    """List pending tickets for branch from GitHub Issues (oldest first)."""
+    dev_label = _get_dev_label(branch)
+    if not dev_label:
+        return []
+    try:
+        return gh_list_issues_with_labels(["queue:pending", dev_label])
+    except Exception:
+        return []
 
 
 def queue_set_active(branch: str, issue_number: int, title: str) -> None:
-    """Mark ticket as active."""
+    """Mark ticket as active (in-memory tracking for /status)."""
     ACTIVE_TICKET[branch] = {"issue_number": issue_number, "title": title}
     CI_PROGRESS[branch] = {
         "started_at": now_ts(),
@@ -701,59 +762,53 @@ def queue_set_active(branch: str, issue_number: int, title: str) -> None:
 
 
 def queue_clear_active(branch: str) -> None:
-    """Clear active ticket."""
+    """Clear active ticket. Removes queue:execute label so recovery doesn't find it."""
+    active = ACTIVE_TICKET.get(branch)
+    if active:
+        try:
+            gh_remove_label(active["issue_number"], "queue:execute")
+        except Exception as e:
+            print(f"[QUEUE] Failed to remove queue:execute from #{active['issue_number']}: {e}")
     ACTIVE_TICKET[branch] = None
     CI_PROGRESS.pop(branch, None)
 
 
 def queue_process_next(branch: str) -> Optional[Dict[str, Any]]:
-    """Process next ticket in queue. Returns created issue or None."""
-    ticket = queue_get_next(branch)
-    if not ticket:
+    """Activate next pending ticket by swapping labels. Triggers CI via labeled event."""
+    dev_label = _get_dev_label(branch)
+    if not dev_label:
         return None
-    
     try:
-        # Create issue on GitHub
-        issue = gh_create_issue(ticket["title"], ticket["body"], extra_labels=ticket.get("labels"))
+        pending = gh_list_issues_with_labels(["queue:pending", dev_label])
+        if not pending:
+            return None
+
+        issue = pending[0]
         issue_number = issue["number"]
-        issue_body = ticket["body"]
-        
-        # Mark as active
-        queue_set_active(branch, issue_number, ticket["title"])
-        
-        # Upload screenshot if present (bytes already downloaded when queued)
-        screenshot_info = ""
-        if ticket.get("screenshot_bytes"):
-            try:
-                ext = ticket.get("screenshot_ext", "jpg")
-                path_in_repo = f"tickets/issue-{issue_number}/screenshot.{ext}"
-                html_url = gh_put_file(
-                    branch=branch,
-                    path=path_in_repo,
-                    content_bytes=ticket["screenshot_bytes"],
-                    message=f"Add screenshot for issue #{issue_number}",
-                )
-                screenshot_info = f"\nScreenshot: {html_url}"
-                # Update issue body with screenshot
-                updated_body = issue_body + f"\n\n---\nBranch: `{branch}`{screenshot_info}"
-                gh_update_issue(issue_number, updated_body)
-            except Exception as e:
-                print(f"[QUEUE] Failed to upload screenshot: {e}")
-        
-        # Notify user
-        chat_id = ticket["chat_id"]
-        remaining = queue_size(branch)
-        queue_info = f"\n\n📋 В очереди ещё: {remaining}" if remaining > 0 else ""
-        
-        tg_send_html(chat_id,
-            f"🎫 Тикет создан: <a href=\"{issue['html_url']}\">#{issue_number}</a>\n"
-            f"{html_escape(ticket['title'])}{queue_info}")
-        
+        issue_title = issue["title"]
+
+        # Swap labels: remove pending, add execute (triggers CI)
+        gh_remove_label(issue_number, "queue:pending")
+        ok = gh_add_label(issue_number, "queue:execute")
+        if not ok:
+            print(f"[QUEUE] Failed to add queue:execute to #{issue_number}")
+            return None
+
+        # Mark as active in memory
+        queue_set_active(branch, issue_number, issue_title)
+
+        # Notify developer
+        dev_ctx = DEV_CHAT.get(branch)
+        if dev_ctx:
+            remaining = len(pending) - 1
+            queue_info = f"\n📋 В очереди ещё: {remaining}" if remaining > 0 else ""
+            tg_send_html(dev_ctx["chat_id"],
+                f"▶️ Следующий тикет: <a href=\"{issue['html_url']}\">#{issue_number}</a>\n"
+                f"{html_escape(issue_title)}{queue_info}")
+
         return issue
     except Exception as e:
-        print(f"[QUEUE] Failed to create issue: {e}")
-        # Notify about error
-        tg_send_html(ticket["chat_id"], f"❌ Ошибка создания тикета: {html_escape(str(e))}")
+        print(f"[QUEUE] Failed to process next: {e}")
         return None
 
 
@@ -1417,56 +1472,16 @@ async def telegram_webhook(req: Request):
 
                 issue_fmt = format_issue(state["text"], chat_id, from_user, dev_info=dev_info)
                 
-                # Check if we should use queue
-                if branch and queue_is_busy(branch):
-                    # Download screenshot bytes now (file_id may expire while in queue)
-                    screenshot_bytes = None
-                    screenshot_ext = None
-                    if state.get("screenshot"):
-                        try:
-                            shot = state["screenshot"]
-                            file_path = tg_get_file_path(shot["file_id"])
-                            if file_path:
-                                screenshot_bytes = tg_download_file_bytes(file_path)
-                                screenshot_ext = shot.get("ext", "jpg")
-                        except Exception as e:
-                            print(f"[QUEUE] Failed to download screenshot: {e}")
-                    
-                    # Add to queue
-                    ticket_data = {
-                        "title": issue_fmt["title"],
-                        "body": issue_fmt["body"],
-                        "labels": extra_labels,
-                        "chat_id": chat_id,
-                        "user_id": clicker_id,
-                        "first_name": from_user.get("first_name", ""),
-                        "dev_info": dev_info,
-                        "screenshot_bytes": screenshot_bytes,
-                        "screenshot_ext": screenshot_ext,
-                    }
-                    position = queue_add_ticket(branch, ticket_data)
-                    active = ACTIVE_TICKET.get(branch, {})
-                    active_num = active.get("issue_number", "?") if active else "?"
-                    
-                    screenshot_note = " (со скриншотом)" if screenshot_bytes else ""
-                    tg_send_message(chat_id,
-                        f"📋 Тикет добавлен в очередь{screenshot_note}\n\n"
-                        f"Позиция: {position}\n"
-                        f"Сейчас выполняется: #{active_num}\n\n"
-                        f"Тикет создастся автоматически когда подойдёт очередь.",
-                        reply_to_message_id=reply_to_id)
-                    PENDING.pop(key, None)
-                    return {"ok": True}
-                
-                # Create issue immediately
+                # Decide: queue (pending) or execute immediately
+                is_busy = branch and queue_is_busy(branch)
+                if is_busy:
+                    extra_labels.append("queue:pending")
+
+                # Create issue on GitHub (with queue:pending if busy, without if free)
                 issue = gh_create_issue(issue_fmt["title"], issue_fmt["body"], extra_labels=extra_labels)
                 issue_url = issue["html_url"]
                 issue_number = issue["number"]
                 issue_body = issue_fmt["body"]
-                
-                # Mark as active in queue
-                if branch:
-                    queue_set_active(branch, issue_number, issue_fmt["title"])
 
                 # Branch from developer mapping or default
                 chosen_branch: Optional[str] = dev_info["branch"] if dev_info else None
@@ -1499,19 +1514,35 @@ async def telegram_webhook(req: Request):
                     updated_body = issue_body + "\n\n---\n" + (branch_info + screenshot_info).strip()
                     gh_update_issue(issue_number, updated_body)
 
-                queue_info = ""
-                if branch:
-                    remaining = queue_size(branch)
-                    if remaining > 0:
-                        queue_info = f"\n\n📋 В очереди: {remaining}"
-                
-                impl_name = "Claude"
-                tg_send_message(chat_id,
-                    f"📋 Тикет создан!\n\n"
-                    f"#{issue_number} ({from_user.get('first_name', '')}): {issue_fmt['title']}\n"
-                    f"{issue_url}\n\n"
-                    f"{impl_name} скоро возьмётся за работу...{queue_info}",
-                    reply_to_message_id=reply_to_id)
+                if is_busy:
+                    # Issue created with queue:pending — notify about queue position
+                    pending_count = queue_size(branch)
+                    active = ACTIVE_TICKET.get(branch, {})
+                    active_num = active.get("issue_number", "?") if active else "?"
+                    tg_send_html(chat_id,
+                        f"📋 Тикет <a href=\"{issue_url}\">#{issue_number}</a> добавлен в очередь\n\n"
+                        f"Позиция: {pending_count}\n"
+                        f"Сейчас выполняется: #{active_num}\n\n"
+                        f"Тикет запустится автоматически когда подойдёт очередь.",
+                        )
+                else:
+                    # Issue created without queue label — trigger CI now
+                    if branch:
+                        gh_add_label(issue_number, "queue:execute")
+                        queue_set_active(branch, issue_number, issue_fmt["title"])
+
+                    queue_info = ""
+                    if branch:
+                        remaining = queue_size(branch)
+                        if remaining > 0:
+                            queue_info = f"\n\n📋 В очереди: {remaining}"
+
+                    tg_send_message(chat_id,
+                        f"📋 Тикет создан!\n\n"
+                        f"#{issue_number} ({from_user.get('first_name', '')}): {issue_fmt['title']}\n"
+                        f"{issue_url}\n\n"
+                        f"Claude скоро возьмётся за работу...{queue_info}",
+                        reply_to_message_id=reply_to_id)
 
             except Exception as e:
                 tg_send_message(chat_id, f"Ошибка: {type(e).__name__}\n{e}", reply_to_message_id=reply_to_id)
@@ -1564,7 +1595,6 @@ async def telegram_webhook(req: Request):
         mins = uptime // 60
         
         # Queue stats
-        total_queued = sum(len(q) for q in TICKET_QUEUE.values())
         active_branches = [b for b, t in ACTIVE_TICKET.items() if t is not None]
         
         debug_text = (
@@ -1574,7 +1604,7 @@ async def telegram_webhook(req: Request):
             f"Uptime: {mins}m {uptime % 60}s\n"
             f"Pending tickets: {len(PENDING)}\n"
             f"Armed users: {len(ARMED)}\n"
-            f"Queue total: {total_queued}\n"
+            f"Queue: GitHub Issues (queue:pending/queue:execute)\n"
             f"Active branches: {active_branches or '—'}\n"
             f"---\n"
             f"GITHUB_REPO: {GITHUB_REPO or '(empty)'}\n"
@@ -1620,6 +1650,7 @@ async def telegram_webhook(req: Request):
             tg_send_message(chat_id, "У тебя нет привязанной dev-ветки.", reply_to_message_id=message_id)
             return {"ok": True}
         branch = dev_info["branch"]
+        queue_is_busy(branch)  # triggers recovery if needed
         active = ACTIVE_TICKET.get(branch)
         pending_count = queue_size(branch)
 
@@ -1649,32 +1680,34 @@ async def telegram_webhook(req: Request):
                 reply_to_message_id=message_id)
         return {"ok": True}
 
-    # Queue status
+    # Queue status (from GitHub Issues)
     if cmd_base == "/queue":
         dev_info = DEVELOPER_MAP.get(user_id)
         if not dev_info:
             tg_send_message(chat_id, "У тебя нет привязанной dev-ветки.", reply_to_message_id=message_id)
             return {"ok": True}
         branch = dev_info["branch"]
+        # Check active (in-memory + GitHub fallback)
+        queue_is_busy(branch)  # triggers recovery if needed
         active = ACTIVE_TICKET.get(branch)
-        pending = TICKET_QUEUE.get(branch, [])
-        
+        pending = queue_list_pending(branch)
+
         lines = [f"📋 Очередь для {branch}\n"]
-        
+
         if active:
             lines.append(f"▶️ Выполняется: #{active['issue_number']} — {active['title'][:50]}")
         else:
             lines.append("▶️ Выполняется: —")
-        
+
         if pending:
             lines.append(f"\n⏳ В очереди: {len(pending)}")
-            for i, t in enumerate(pending[:5], 1):
-                lines.append(f"  {i}. {t['title'][:40]}")
+            for i, iss in enumerate(pending[:5], 1):
+                lines.append(f"  {i}. #{iss['number']} — {iss['title'][:40]}")
             if len(pending) > 5:
                 lines.append(f"  ... и ещё {len(pending) - 5}")
         else:
             lines.append("\n⏳ Очередь пуста")
-        
+
         tg_send_message(chat_id, "\n".join(lines), reply_to_message_id=message_id)
         return {"ok": True}
 
@@ -1687,7 +1720,7 @@ async def telegram_webhook(req: Request):
         branch = dev_info["branch"]
         active = ACTIVE_TICKET.get(branch)
         progress = CI_PROGRESS.get(branch)
-        pending = TICKET_QUEUE.get(branch, [])
+        pending = queue_list_pending(branch)
         deploy_url = LAST_DEPLOY_URL.get(branch)
 
         lines: List[str] = [f"📊 Статус — {branch}\n"]
@@ -1745,8 +1778,8 @@ async def telegram_webhook(req: Request):
 
         if pending:
             lines.append(f"\n📋 В очереди: {len(pending)}")
-            for i, t in enumerate(pending[:5], 1):
-                lines.append(f"  {i}. {t['title'][:50]}")
+            for i, iss in enumerate(pending[:5], 1):
+                lines.append(f"  {i}. #{iss['number']} — {iss['title'][:50]}")
             if len(pending) > 5:
                 lines.append(f"  ... и ещё {len(pending) - 5}")
         else:
