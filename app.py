@@ -225,7 +225,7 @@ def _repo_short(repo: str) -> str:
 
 
 # Debug / versioning
-BOT_VERSION = "0.19.3"  # ← PERSIST_DIR for Railway volume + master merge filter
+BOT_VERSION = "0.19.4"  # ← debug logging for NETLIFY maps
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -290,6 +290,9 @@ print(f"[BOT] REPO_CONFIG={REPO_CONFIG}")
 print(f"[BOT] CHAT_TO_REPO={CHAT_TO_REPO}")
 print(f"[BOT] SHORT_TO_REPO={SHORT_TO_REPO}")
 print(f"[BOT] NETLIFY_SITE_MAP={NETLIFY_SITE_MAP}")
+print(f"[BOT] NETLIFY_APP_PATHS={NETLIFY_APP_PATHS}")
+print(f"[BOT] _REPO_TO_SITE={_REPO_TO_SITE}")
+print(f"[BOT] PERSIST_DIR={_PERSIST_DIR}")
 print(f"[BOT] WEBAPP_PROD={WEBAPP_URL_PRODUCTION or '(empty)'}")
 print(f"[BOT] WEBAPP_DEV1={WEBAPP_URL_DEV_1 or '(empty)'} ({WEBAPP_DEV_1_NAME})")
 print(f"[BOT] WEBAPP_DEV2={WEBAPP_URL_DEV_2 or '(empty)'} ({WEBAPP_DEV_2_NAME})")
@@ -1917,6 +1920,10 @@ async def telegram_webhook(req: Request):
             f"WEBAPP_PROD: {'✅' if WEBAPP_URL_PRODUCTION else '❌'}\n"
             f"WEBAPP_DEV1: {'✅' if WEBAPP_URL_DEV_1 else '❌'} {WEBAPP_DEV_1_NAME}\n"
             f"WEBAPP_DEV2: {'✅' if WEBAPP_URL_DEV_2 else '❌'} {WEBAPP_DEV_2_NAME}\n"
+            f"NETLIFY_SITE_MAP: {NETLIFY_SITE_MAP or '(empty)'}\n"
+            f"NETLIFY_APP_PATHS: {NETLIFY_APP_PATHS or '(empty)'}\n"
+            f"REPO_TO_SITE: {_REPO_TO_SITE or '(empty)'}\n"
+            f"PERSIST_DIR: {_PERSIST_DIR}\n"
             f"DEV_CHAT: {dict(list(DEV_CHAT.items())[:5]) or '(empty)'}\n"
             f"REQUIRE_TICKET_CMD: {REQUIRE_TICKET_COMMAND}\n"
             f"Group chat: {in_group}\n"
