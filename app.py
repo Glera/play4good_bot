@@ -67,7 +67,7 @@ DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 _BRANCH_TO_DEV: Dict[str, int] = {info["branch"]: uid for uid, info in DEVELOPER_MAP.items()}
 
 # Debug / versioning
-BOT_VERSION = "0.12.1"  # ← DEV_CHAT fallback from DEVELOPER_MAP after bot restart
+BOT_VERSION = "0.13.0"  # ← implementer model selection (opus/codex)
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -105,9 +105,9 @@ APPROVAL_REQUESTS: Dict[str, Any] = {}
 APPROVAL_AWAITING_FEEDBACK: Dict[int, Dict[str, str]] = {}
 
 # Default ticket options
-DEFAULT_OPTIONS = {"multi_agent": False, "testing": False, "approve_plan": False}
+DEFAULT_OPTIONS = {"multi_agent": False, "testing": False, "approve_plan": False, "implementer": "opus"}
 
-# Labels for ticket options
+# Labels for ticket options (boolean options only — implementer handled separately)
 OPTION_LABELS = {
     "multi_agent": "ci:multi-agent",
     "testing": "ci:testing",
@@ -588,6 +588,8 @@ def confirmation_text(state: Dict[str, Any]) -> str:
 
     # Option toggles display
     opt_parts = []
+    impl_model = opts.get('implementer', 'opus')
+    opt_parts.append(f"{'🧠 Opus' if impl_model == 'opus' else '⚡ Codex'} пишет")
     opt_parts.append(f"{'✅' if opts.get('multi_agent') else '—'} мультиагент")
     opt_parts.append(f"{'✅' if opts.get('testing') else '—'} тесты")
     opt_parts.append(f"{'✅' if opts.get('approve_plan') else '—'} апрув плана")
@@ -603,10 +605,15 @@ def confirmation_text(state: Dict[str, Any]) -> str:
 
 def confirmation_keyboard(author_id: int, state: Dict[str, Any]) -> List[List[Dict[str, str]]]:
     opts = state.get("options", DEFAULT_OPTIONS)
+    impl_model = opts.get('implementer', 'opus')
+    impl_btn = f"{'🧠' if impl_model == 'opus' else '⚡'} {impl_model.capitalize()} → код"
     return [
         [{"text": "✅ Создать issue", "callback_data": f"create:{author_id}"}],
         [
+            {"text": impl_btn, "callback_data": f"opt_impl:{author_id}"},
             {"text": f"{'🤖' if opts.get('multi_agent') else '⬜'} Мультиагент", "callback_data": f"opt_ma:{author_id}"},
+        ],
+        [
             {"text": f"{'🧪' if opts.get('testing') else '⬜'} Тесты", "callback_data": f"opt_test:{author_id}"},
             {"text": f"{'📋' if opts.get('approve_plan') else '⬜'} Апрув", "callback_data": f"opt_appr:{author_id}"},
         ],
@@ -1304,11 +1311,15 @@ async def telegram_webhook(req: Request):
             return {"ok": True}
 
         # Toggle ticket options (re-render confirmation in-place)
-        if action in ("opt_ma", "opt_test", "opt_appr"):
+        if action in ("opt_ma", "opt_test", "opt_appr", "opt_impl"):
             opts = state.get("options", dict(DEFAULT_OPTIONS))
-            toggle_map = {"opt_ma": "multi_agent", "opt_test": "testing", "opt_appr": "approve_plan"}
-            opt_key = toggle_map[action]
-            opts[opt_key] = not opts.get(opt_key, False)
+            if action == "opt_impl":
+                # Toggle between "opus" and "codex"
+                opts["implementer"] = "codex" if opts.get("implementer", "opus") == "opus" else "opus"
+            else:
+                toggle_map = {"opt_ma": "multi_agent", "opt_test": "testing", "opt_appr": "approve_plan"}
+                opt_key = toggle_map[action]
+                opts[opt_key] = not opts.get(opt_key, False)
             state["options"] = opts
 
             # Edit existing message with updated text and keyboard
@@ -1347,6 +1358,9 @@ async def telegram_webhook(req: Request):
                 for opt_key, label_name in OPTION_LABELS.items():
                     if opts.get(opt_key):
                         extra_labels.append(label_name)
+                # Add implementer label (only when codex — opus is default)
+                if opts.get("implementer") == "codex":
+                    extra_labels.append("ci:codex-impl")
 
                 if dev_info:
                     branch = dev_info["branch"]
@@ -1659,14 +1673,18 @@ async def telegram_webhook(req: Request):
                 multi = opts.get("multi_agent") == "true"
                 testing = opts.get("testing") == "true"
                 approve = opts.get("approve") == "true"
+                codex_impl = opts.get("codex_impl") == "true"
+
+                impl_name = "Codex" if codex_impl else "Opus"
+                reviewer_name = "Opus" if codex_impl else "Codex"
 
                 # Define all possible workflow steps
                 all_steps = [
-                    ("1", "Планирование", True),
-                    ("2", "Codex ревью", multi),
+                    ("1", f"Планирование ({impl_name})", True),
+                    ("2", f"{reviewer_name} ревью", multi),
                     ("A", "Апрув плана", approve),
-                    ("3", "Реализация", True),
-                    ("4", "Код ревью", multi),
+                    ("3", f"Реализация ({impl_name})", True),
+                    ("4", f"{reviewer_name} код ревью", multi),
                     ("5", "Тестирование", testing),
                     ("6", "Финализация", True),
                 ]
