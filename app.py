@@ -67,7 +67,7 @@ DEVELOPER_MAP: Dict[int, Dict[str, str]] = _parse_developer_map(_DEV_MAP_RAW)
 _BRANCH_TO_DEV: Dict[str, int] = {info["branch"]: uid for uid, info in DEVELOPER_MAP.items()}
 
 # Debug / versioning
-BOT_VERSION = "0.14.0"  # ← add ci:large profile toggle
+BOT_VERSION = "0.15.0"  # ← auto-backup before /reset
 BOT_STARTED_AT = int(time.time())
 BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RAILWAY_DEPLOYMENT_ID", os.environ.get("RENDER_GIT_COMMIT", "local")))
 
@@ -368,6 +368,26 @@ def gh_force_reset_branch(branch: str, to_branch: str = "main") -> str:
     if r.status_code >= 300:
         raise RuntimeError(f"Force reset failed {r.status_code}: {r.text[:500]}")
     return target_sha
+
+
+def gh_create_tag(tag_name: str, sha: str) -> str:
+    """Create a lightweight tag pointing at the given SHA.
+    Returns the tag name. Silently succeeds if tag already exists."""
+    owner, repo = gh_repo_parts()
+    r = requests.post(
+        f"{GH_API}/repos/{owner}/{repo}/git/refs",
+        headers=gh_headers(),
+        json={"ref": f"refs/tags/{tag_name}", "sha": sha},
+        timeout=30,
+    )
+    if r.status_code == 422:
+        # Tag already exists — fine
+        print(f"[TAG] Tag {tag_name} already exists, skipping")
+        return tag_name
+    if r.status_code >= 300:
+        raise RuntimeError(f"Create tag failed {r.status_code}: {r.text[:500]}")
+    print(f"[TAG] Created tag {tag_name} → {sha[:7]}")
+    return tag_name
 
 
 def gh_put_file(branch: str, path: str, content_bytes: bytes, message: str) -> str:
@@ -1293,10 +1313,24 @@ async def telegram_webhook(req: Request):
                 return {"ok": True}
             branch = dev_info["branch"]
             try:
+                # Auto-backup: tag the branch before resetting (skip if already at main)
+                backup_note = ""
+                try:
+                    branch_sha = gh_get_branch_sha(branch)
+                    main_sha = gh_get_branch_sha("main")
+                    if branch_sha != main_sha:
+                        short_name = branch.split("/")[-1]  # "dev/Gleb" → "Gleb"
+                        tag_name = f"backup/{short_name}/{time.strftime('%Y-%m-%d')}-{branch_sha[:7]}"
+                        gh_create_tag(tag_name, branch_sha)
+                        backup_note = f"\n📦 Бэкап: `{tag_name}`"
+                except Exception as tag_err:
+                    print(f"[RESET] Backup tag failed (non-fatal): {tag_err}")
+                    backup_note = "\n⚠️ Бэкап не удался (ветка всё равно сброшена)"
+
                 sha = gh_force_reset_branch(branch, "main")
                 short_sha = sha[:7]
                 print(f"[RESET] user={clicker_id} branch={branch} → main ({short_sha})")
-                tg_send_message(chat_id, f"✅ Ветка `{branch}` сброшена до `main` ({short_sha}).", reply_to_message_id=reply_to_id)
+                tg_send_message(chat_id, f"✅ Ветка `{branch}` сброшена до `main` ({short_sha}).{backup_note}", reply_to_message_id=reply_to_id)
             except Exception as e:
                 print(f"[RESET] ERROR user={clicker_id} branch={branch}: {e}")
                 tg_send_message(chat_id, f"❌ Ошибка: {type(e).__name__}\n{e}", reply_to_message_id=reply_to_id)
