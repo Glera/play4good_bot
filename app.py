@@ -1718,6 +1718,7 @@ async def telegram_webhook(req: Request):
             tg_send_message(chat_id, "У тебя нет привязанной dev-ветки.", reply_to_message_id=message_id)
             return {"ok": True}
         branch = dev_info["branch"]
+        queue_is_busy(branch)  # triggers recovery from GitHub if needed after bot restart
         active = ACTIVE_TICKET.get(branch)
         progress = CI_PROGRESS.get(branch)
         pending = queue_list_pending(branch)
