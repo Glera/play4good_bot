@@ -894,6 +894,7 @@ async def claude_message(req: Request):
     issue_number = payload.get("issue_number", "")
     message_type = payload.get("type", "info")
     text = payload.get("text", "")
+    phase_name = payload.get("phase_name", "")
 
     print(f"[CLAUDE_MSG] type={message_type} branch={branch} issue=#{issue_number}")
     print(f"[CLAUDE_MSG] text={text[:200]}")
@@ -966,9 +967,18 @@ async def claude_message(req: Request):
     emoji = config["emoji"]
     header = config["header"]
 
-    if header:
+    # Include phase name in header when available (e.g. "Планирование · План")
+    safe_phase = html_escape(phase_name) if phase_name else ""
+    if safe_phase and header:
+        full_header = f"{safe_phase} · {header}"
+    elif safe_phase:
+        full_header = safe_phase
+    else:
+        full_header = header
+
+    if full_header:
         tg_send_html(chat_id,
-            f"{emoji} <b>{header}</b> — #{issue_number}\n\n{safe_text}")
+            f"{emoji} <b>{full_header}</b> — #{issue_number}\n\n{safe_text}")
     else:
         tg_send_html(chat_id,
             f"{emoji} <b>Claude #{issue_number}</b>\n\n{safe_text}")
