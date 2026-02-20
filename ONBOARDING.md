@@ -66,7 +66,7 @@ npm init -y
 #   main: "dist/index.js"
 #   types: "dist/index.d.ts"
 #   files: ["dist"]
-#   scripts: { build, test, check, playground }
+#   scripts: { build, test, check }
 ```
 
 ### Шаг 2: Структура пакета
@@ -77,18 +77,14 @@ puzzle-core/
 │   ├── index.ts          # Экспорты + CORE_VERSION
 │   ├── types.ts           # Типы
 │   └── logic.ts           # Игровая логика (pure functions)
-├── playground/
-│   ├── index.html         # Entry point
-│   ├── main.ts            # Vanilla TS UI
-│   ├── style.css          # Стили
-│   └── vite.config.ts     # Vite с alias на ../src/index.ts
 ├── tests/
 │   └── core.test.ts       # Smoke tests
-├── netlify.toml           # Build: playground → корень сайта
 ├── CLAUDE.md              # Инструкции для CI-агента
 ├── tsconfig.json
 └── package.json
 ```
+
+Playground отсутствует — визуальное тестирование через платформу (`p4g-platform` с `GAME=puzzle`).
 
 ### Шаг 3: CORE_VERSION
 
@@ -98,30 +94,22 @@ export const CORE_VERSION = '0.1.0';
 ```
 CI-агент **обязан** инкрементировать PATCH на каждый коммит.
 
-### Шаг 4: netlify.toml
-
-```toml
-[build]
-  command = "npm install && npx vite build --config playground/vite.config.ts"
-  publish = "playground/dist"
-```
-
-### Шаг 5: CI workflow
+### Шаг 4: CI workflow
 
 Скопировать `.github/workflows/claude.yml` из `mahjong-core`, обновить:
 - Секцию "Notify: changes pushed" — `grep CORE_VERSION` из `src/index.ts`
 - Секреты: `BOT_WEBHOOK_URL`, `ANTHROPIC_API_KEY`
 
-### Шаг 6: CLAUDE.md
+### Шаг 5: CLAUDE.md
 
 Обязательные секции:
-- Commands (build, test, check, playground)
+- Commands (build, test, check)
 - Architecture (файлы, экспорты)
 - Core / Platform boundary (что core, что shell)
 - **Versioning** — обязательный бамп CORE_VERSION на каждый коммит
-- Standalone playground (структура, API таблица)
+- Тестирование через платформу (команда запуска)
 
-### Шаг 7: Бот — регистрация репо
+### Шаг 6: Бот — регистрация репо
 
 В Railway env:
 ```
@@ -129,18 +117,21 @@ GITHUB_REPOS=...,Owner/puzzle-core:puzzle:main
 NETLIFY_SITE_MAP=...,puzzle-dev-gleb:Owner/puzzle-core
 ```
 
-### Шаг 8: Netlify — сайт
+### Шаг 7: Netlify — сайт
 
 1. Создать сайт `puzzle-dev-gleb` → branch `dev/Gleb`
 2. Добавить webhook: `https://{bot-host}/netlify/webhook`
 
-### Шаг 9: Проверка
+### Шаг 8: Проверка
 
 ```bash
 # Локально
 cd puzzle-core
 npm test && npm run build
-npm run playground  # http://localhost:5173 — проверить UI
+
+# Визуальная проверка через платформу
+cd ../p4g-platform
+GAME=puzzle npm run dev  # http://localhost:3002
 
 # Через бота
 /repo puzzle

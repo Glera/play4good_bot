@@ -1115,11 +1115,17 @@ async def github_notify(req: Request):
         # Mark as recently completed (grace period for post-merge Netlify deploys)
         RECENTLY_COMPLETED[ctx] = time.time()
 
-        # Include deploy URL: saved from Netlify webhook, or construct from NETLIFY_SITE_MAP
-        deploy_url = LAST_DEPLOY_URL.pop(ctx, "") or _construct_deploy_url(repo)
+        # Check if deploy already arrived (saved from earlier Netlify webhook)
+        deploy_url = LAST_DEPLOY_URL.pop(ctx, "")
         version = payload.get("version", "")
         version_hint = f" (v{version})" if version else ""
-        deploy_line = f"\n\n🔗 <a href=\"{deploy_url}\">Открыть билд{version_hint}</a>" if deploy_url else ""
+
+        if deploy_url:
+            # Deploy already ready — include link directly
+            deploy_line = f"\n\n🔗 <a href=\"{deploy_url}\">Открыть билд{version_hint}</a>"
+        else:
+            # Deploy not ready yet — will arrive via Netlify webhook as separate message
+            deploy_line = "\n\n⏳ Ждём билд..."
 
         text = (
             f"📦 Задача завершена{repo_tag} — {safe_branch}\n\n"
@@ -1130,13 +1136,13 @@ async def github_notify(req: Request):
         keyboard = [[{"text": "⭐ Забрать в main", "callback_data": f"pick:{repo}:{issue_number}"}]]
         resp = tg_send_message_with_keyboard(chat_id, text, keyboard, parse_mode="HTML")
 
-        # If no deploy URL yet, save message for Netlify to edit later
-        if not deploy_url and resp and resp.get("ok"):
-            msg_id = resp["result"]["message_id"]
+        # If deploy not ready, save context for Netlify webhook to send a new message
+        if not deploy_url:
             RECENTLY_MERGED[ctx] = {
-                "chat_id": chat_id, "message_id": msg_id,
-                "text": text, "issue_number": issue_number,
+                "chat_id": chat_id,
+                "issue_number": issue_number,
                 "repo": repo,
+                "version": version,
                 "ts": time.time(),
             }
 
@@ -1430,24 +1436,21 @@ async def netlify_webhook(req: Request):
             print(f"[NETLIFY] Branch {branch} just created/reset — saved deploy URL silently")
             return {"ok": True, "skipped": "branch_just_created", "deploy_url_saved": True}
 
-        # If task just finished (merged), edit the "📦 Задача завершена" message to add deploy link
+        # If task just finished (merged), send deploy link as a NEW message
         merged_info = RECENTLY_MERGED.pop(ctx, None)
-        if merged_info and (time.time() - merged_info["ts"]) < 180:
+        if merged_info and (time.time() - merged_info["ts"]) < 300:
             app_url = _netlify_app_url(ssl_url, site_name)
-            updated_text = merged_info["text"] + f"\n\n🔗 <a href=\"{app_url}\">Открыть билд</a>"
-            pick_repo = merged_info.get("repo", repo)
-            keyboard = [[{"text": "⭐ Забрать в main", "callback_data": f"pick:{pick_repo}:{merged_info['issue_number']}"}]]
-            tg_edit_message_with_keyboard(
-                merged_info["chat_id"], merged_info["message_id"],
-                updated_text, keyboard, parse_mode="HTML",
-            )
-            print(f"[NETLIFY] Edited merged message for {branch} with deploy URL")
-            return {"ok": True, "edited_merged": True}
+            version = merged_info.get("version", "")
+            version_hint = f" (v{version})" if version else ""
+            text = f"✅ Билд готов{version_hint}! Можно тестировать\n\n🔗 <a href=\"{app_url}\">Открыть</a>"
+            tg_send_html(merged_info["chat_id"], text)
+            print(f"[NETLIFY] Sent deploy message for {branch}")
+            return {"ok": True, "deploy_sent": True}
 
         # Grace period: suppress standalone deploy notifications shortly after task completion
         # (handles multiple Netlify deploys arriving after merge — e.g. merge commit, infra commits)
         completed_at = RECENTLY_COMPLETED.get(ctx, 0)
-        if completed_at and (time.time() - completed_at) < 90:
+        if completed_at and (time.time() - completed_at) < 300:
             print(f"[NETLIFY] Task recently completed on {ctx} ({time.time() - completed_at:.0f}s ago) — suppressing standalone deploy")
             return {"ok": True, "skipped": "recently_completed"}
 
