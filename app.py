@@ -1792,9 +1792,12 @@ async def telegram_webhook(req: Request):
 
                     queue_info = ""
                     if branch:
-                        remaining = queue_size(target_repo, branch)
-                        if remaining > 0:
-                            queue_info = f"\n\n📋 В очереди: {remaining}"
+                        remaining_list = queue_list_pending(target_repo, branch)
+                        if remaining_list:
+                            q_lines = [f"📋 В очереди: {len(remaining_list)}"]
+                            for qi, qiss in enumerate(remaining_list[:3], 1):
+                                q_lines.append(f"  {qi}. [{_repo_short(target_repo)}] #{qiss['number']} — {qiss['title'][:40]}")
+                            queue_info = "\n\n" + "\n".join(q_lines)
 
                     tg_send_message(chat_id,
                         f"📋 Тикет создан!{repo_tag}\n\n"
@@ -2024,7 +2027,7 @@ async def telegram_webhook(req: Request):
         if pending:
             lines.append(f"\n⏳ В очереди: {len(pending)}")
             for i, iss in enumerate(pending[:5], 1):
-                lines.append(f"  {i}. #{iss['number']} — {iss['title'][:40]}")
+                lines.append(f"  {i}. [{_repo_short(q_repo)}] #{iss['number']} — {iss['title'][:40]}")
             if len(pending) > 5:
                 lines.append(f"  ... и ещё {len(pending) - 5}")
         else:
@@ -2105,7 +2108,7 @@ async def telegram_webhook(req: Request):
         if pending:
             lines.append(f"\n📋 В очереди: {len(pending)}")
             for i, iss in enumerate(pending[:5], 1):
-                lines.append(f"  {i}. #{iss['number']} — {iss['title'][:50]}")
+                lines.append(f"  {i}. [{_repo_short(s_repo)}] #{iss['number']} — {iss['title'][:50]}")
             if len(pending) > 5:
                 lines.append(f"  ... и ещё {len(pending) - 5}")
         else:
