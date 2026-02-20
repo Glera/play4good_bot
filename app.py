@@ -1115,36 +1115,29 @@ async def github_notify(req: Request):
         # Mark as recently completed (grace period for post-merge Netlify deploys)
         RECENTLY_COMPLETED[ctx] = time.time()
 
-        # Check if deploy already arrived (saved from earlier Netlify webhook)
-        deploy_url = LAST_DEPLOY_URL.pop(ctx, "")
+        # Always show "waiting for build" — the final commit was JUST pushed,
+        # so any cached LAST_DEPLOY_URL is from a previous (stale) deploy.
+        # The real deploy link will arrive via Netlify webhook as a separate message.
+        LAST_DEPLOY_URL.pop(ctx, None)  # clear stale URL
         version = payload.get("version", "")
-        version_hint = f" (v{version})" if version else ""
-
-        if deploy_url:
-            # Deploy already ready — include link directly
-            deploy_line = f"\n\n🔗 <a href=\"{deploy_url}\">Открыть билд{version_hint}</a>"
-        else:
-            # Deploy not ready yet — will arrive via Netlify webhook as separate message
-            deploy_line = "\n\n⏳ Ждём билд..."
 
         text = (
             f"📦 Задача завершена{repo_tag} — {safe_branch}\n\n"
             f"#{issue_number} ({html_escape(dev_ctx['first_name'])}): {safe_title}"
-            f"{deploy_line}")
+            f"\n\n⏳ Ждём билд...")
 
         # Send with "cherry-pick to main" button
         keyboard = [[{"text": "⭐ Забрать в main", "callback_data": f"pick:{repo}:{issue_number}"}]]
         resp = tg_send_message_with_keyboard(chat_id, text, keyboard, parse_mode="HTML")
 
-        # If deploy not ready, save context for Netlify webhook to send a new message
-        if not deploy_url:
-            RECENTLY_MERGED[ctx] = {
-                "chat_id": chat_id,
-                "issue_number": issue_number,
-                "repo": repo,
-                "version": version,
-                "ts": time.time(),
-            }
+        # Save context for Netlify webhook to send deploy link as separate message
+        RECENTLY_MERGED[ctx] = {
+            "chat_id": chat_id,
+            "issue_number": issue_number,
+            "repo": repo,
+            "version": version,
+            "ts": time.time(),
+        }
 
         # Clear active and process queue
         queue_clear_active(repo, branch)
