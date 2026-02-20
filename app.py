@@ -352,9 +352,11 @@ def tg_send_message(chat_id: int, text: str, reply_to_message_id: Optional[int] 
         print(f"[TG ERROR] sendMessage failed: {resp.get('error_code')} {resp.get('description')}")
 
 
-def tg_send_html(chat_id: int, html: str) -> None:
+def tg_send_html(chat_id: int, html: str, reply_to_message_id: int | None = None) -> None:
     """Send message with HTML parse_mode (for user mentions etc)."""
     payload: Dict[str, Any] = {"chat_id": chat_id, "text": html, "parse_mode": "HTML"}
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
     r = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=30)
     resp = r.json()
     if not resp.get("ok"):
@@ -362,6 +364,8 @@ def tg_send_html(chat_id: int, html: str) -> None:
         print(f"[TG_HTML ERROR] chat_id={chat_id} text={html[:200]}")
         # Fallback: try without HTML parse_mode
         fallback_payload: Dict[str, Any] = {"chat_id": chat_id, "text": html}
+        if reply_to_message_id:
+            fallback_payload["reply_to_message_id"] = reply_to_message_id
         requests.post(f"{TG_API}/sendMessage", json=fallback_payload, timeout=30)
 
 
